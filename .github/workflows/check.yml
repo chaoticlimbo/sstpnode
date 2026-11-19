@@ -2,7 +2,7 @@ name: VPN Gate Node Check
 
 on:
   schedule:
-    - cron: '0 *1 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       max_nodes:
@@ -119,5 +119,6 @@ jobs:
 
       - name: Show site URL
         run: |
-          echo "订阅地址：https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/nodes.txt"
-          echo "仪表盘：  https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/"
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          echo "订阅地址：https://${{ github.repository_owner }}.github.io/${repo_name}/nodes.txt"
+          echo "仪表盘：  https://${{ github.repository_owner }}.github.io/${repo_name}/"
