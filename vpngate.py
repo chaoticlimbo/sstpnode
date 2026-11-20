@@ -3,7 +3,7 @@
 
 流程:
   1. 从 funcra/vg-mirror/servers_history/info.json 动态获取全部历史 CSV 节点
-  2. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
+  2. 只保留带 TCP 入口且属于目标国家/地区（默认美国、日本、新加坡）的 SSTP 节点
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
   5. 合并静态优选域名与优选 API 端点
@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import os
+import posixpath
 import re
 import sys
 import time
@@ -50,6 +51,24 @@ DEFAULT_VG_HISTORY_INFO_URL = (
     "https://raw.githubusercontent.com/funcra/vg-mirror/main/servers_history/info.json"
 )
 DEFAULT_OPTIMAL_API = ""
+
+# 仅保留美国、日本、新加坡
+DEFAULT_ALLOWED_COUNTRY_CODES = frozenset({"US", "JP", "SG"})
+COUNTRY_NAME_TO_CODE = {
+    "US": "US",
+    "USA": "US",
+    "UNITED STATES": "US",
+    "UNITED STATES OF AMERICA": "US",
+    "美国": "US",
+    "JP": "JP",
+    "JPN": "JP",
+    "JAPAN": "JP",
+    "日本": "JP",
+    "SG": "SG",
+    "SGP": "SG",
+    "SINGAPORE": "SG",
+    "新加坡": "SG",
+}
 
 # 占位符检测：命中任意一个就认为用户还没配置
 PLACEHOLDER_MARKERS = ("你的", "YOUR_", "YOUR-", "example.com", "yourdomain")
@@ -159,6 +178,45 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
     if value < minimum:
         raise ConfigError(f"{name} 不能小于 {minimum}，当前值：{value}")
     return value
+
+
+def parse_allowed_countries(raw: str | None) -> frozenset[str]:
+    """解析允许的国家代码集合，默认仅美国(US)、日本(JP)、新加坡(SG)。"""
+    if not raw or not raw.strip():
+        return DEFAULT_ALLOWED_COUNTRY_CODES
+    codes: set[str] = set()
+    for part in raw.split(","):
+        token = part.strip().upper()
+        if not token:
+            continue
+        mapped = COUNTRY_NAME_TO_CODE.get(token, token)
+        if mapped in DEFAULT_ALLOWED_COUNTRY_CODES:
+            codes.add(mapped)
+    return frozenset(codes) if codes else DEFAULT_ALLOWED_COUNTRY_CODES
+
+
+def resolve_country_code(country_code: str | None, country_name: str | None = None) -> str:
+    """将国家代码或国家名称归一化为两位国家代码（如 US / JP / SG）。"""
+    code = (country_code or "").strip().upper()
+    if code in COUNTRY_NAME_TO_CODE:
+        return COUNTRY_NAME_TO_CODE[code]
+    if code:
+        return code
+    name = (country_name or "").strip().upper()
+    if name in COUNTRY_NAME_TO_CODE:
+        return COUNTRY_NAME_TO_CODE[name]
+    return ""
+
+
+def is_allowed_country(
+    country_code: str | None,
+    country_name: str | None = None,
+    allowed_codes: Iterable[str] = DEFAULT_ALLOWED_COUNTRY_CODES,
+) -> bool:
+    """判断节点是否属于允许的国家/地区（默认 US / JP / SG）。"""
+    allowed = frozenset(c.upper() for c in allowed_codes)
+    resolved = resolve_country_code(country_code, country_name)
+    return resolved in allowed
 
 
 def normalize_worker_base(raw: str) -> str:
@@ -288,6 +346,7 @@ class Config:
     vg_history_info_url: str = DEFAULT_VG_HISTORY_INFO_URL
     vpngate_api: str = ""
     vpngate_mirror: str = ""
+    allowed_countries: frozenset[str] = DEFAULT_ALLOWED_COUNTRY_CODES
 
     @classmethod
     def load(cls) -> "Config":
@@ -329,6 +388,7 @@ class Config:
             vg_history_info_url=info_url,
             vpngate_api=os.environ.get("VPNGATE_API", "").strip(),
             vpngate_mirror=os.environ.get("VPNGATE_MIRROR", "").strip(),
+            allowed_countries=parse_allowed_countries(os.environ.get("TARGET_COUNTRIES")),
         )
 
 
@@ -613,9 +673,19 @@ class Node:
         }
 
 
-def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
+def to_sstp_nodes(
+    rows: Iterable[dict[str, Any]],
+    allowed_countries: Iterable[str] = DEFAULT_ALLOWED_COUNTRY_CODES,
+) -> list[Node]:
+    allowed = frozenset(c.upper() for c in allowed_countries)
     nodes: list[Node] = []
     for row in rows:
+        raw_code = (row.get("country_short") or "").strip()
+        raw_country = (row.get("country_long") or "").strip()
+        if not is_allowed_country(raw_code, raw_country, allowed):
+            continue
+        resolved_code = resolve_country_code(raw_code, raw_country)
+
         config_b64 = row.get("config_b64") or ""
         if not config_b64:
             continue
@@ -644,8 +714,8 @@ def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
                 host=host,
                 port=port,
                 ip=(row.get("ip") or "").strip(),
-                country=(row.get("country_long") or "").strip(),
-                country_code=(row.get("country_short") or "").strip().upper(),
+                country=raw_country,
+                country_code=resolved_code,
                 ping=row.get("ping"),
                 score=row.get("score"),
             )
@@ -1029,16 +1099,20 @@ def main() -> None:
     session = make_session(pool_size=cfg.concurrency)
     log("CONFIG", f"检测地址: {cfg.worker_base.rsplit('?', 1)[0]}?sstp=***")
     log("CONFIG", f"并发 {cfg.concurrency}, 单节点超时 {cfg.check_timeout}s, 整体截止 {cfg.deadline_s}s")
+    log("CONFIG", f"筛选国家/地区: {', '.join(sorted(cfg.allowed_countries))}")
 
     rows, source = fetch_vpngate(cfg, session)
     raw_count = len(rows)
     if raw_count == 0:
         die("VPN GATE", "VPN Gate 返回 0 个原始节点，拒绝生成空结果")
 
-    sstp_nodes = to_sstp_nodes(rows)
+    sstp_nodes = to_sstp_nodes(rows, allowed_countries=cfg.allowed_countries)
     sstp_count = len(sstp_nodes)
     if sstp_count == 0:
-        die("VPN GATE", f"从 {raw_count} 个原始节点中没有解析出任何 SSTP(TCP) 节点")
+        die(
+            "VPN GATE",
+            f"从 {raw_count} 个原始节点中没有解析出任何属于 ({', '.join(sorted(cfg.allowed_countries))}) 的 SSTP(TCP) 节点",
+        )
 
     unique_nodes = prioritize(dedupe_nodes(sstp_nodes))
     if cfg.max_check_nodes > 0:
