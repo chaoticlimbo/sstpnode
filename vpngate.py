@@ -7,7 +7,7 @@
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
   5. 合并静态优选 IP 与优选 API 端点
-  6. 生成 public/data.json + public/index.html + public/nodes.txt（默认输出延迟前 50 名）
+  6. 生成 public/data.json + public/index.html + public/nodes.txt（默认限定前 50 个节点）
 
 配置全部来自环境变量。模板仓库约定：用户只需在仓库里配置 Secret `DOMAIN`，
 工作流会拼出检测地址；本地运行时可以直接设置 CHECK_WORKER。
@@ -1021,9 +1021,9 @@ def build_outputs(
 def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -> str:
     if not edge_hosts:
         raise ConfigError("优选入口池为空，无法生成 nodes.txt")
-
-    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    lines: list[str] = []
     seen_links: set[str] = set()
+    index = 0
     ordered = sorted(
         data["countries"].items(),
         key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
@@ -1037,36 +1037,22 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
         residential = [n for n in nodes if n.get("residential") == "residential"]
         others = [n for n in nodes if n.get("residential") != "residential"]
         chosen = residential[: cfg.max_residential_per_country] + others[: cfg.max_datacenter_per_country]
+        counters = {"residential": 0, "datacenter": 0, "unknown": 0}
         for node in chosen:
             link = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
             if link in seen_links:
                 continue
             seen_links.add(link)
-            candidates.append((code, name, node))
+            kind_key = node.get("residential") if node.get("residential") in counters else "unknown"
+            counters[kind_key] += 1
+            kind = {"residential": "住宅", "datacenter": "机房", "unknown": "未知"}[kind_key]
+            entry = edge_hosts[index % len(edge_hosts)]
+            index += 1
+            lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
 
-    # 按检测延迟（latency_ms）升序排列，限定输出前 max_output_nodes（默认 50）个节点
-    candidates.sort(
-        key=lambda item: (
-            item[2].get("latency_ms") is None,
-            item[2].get("latency_ms") if item[2].get("latency_ms") is not None else float("inf"),
-            item[2].get("residential") != "residential",
-            str(item[2].get("host") or ""),
-        )
-    )
     limit = getattr(cfg, "max_output_nodes", DEFAULT_MAX_OUTPUT_NODES)
     if limit > 0:
-        candidates = candidates[:limit]
-
-    lines: list[str] = []
-    country_counters: dict[str, dict[str, int]] = {}
-    for index, (code, name, node) in enumerate(candidates):
-        link = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
-        counters = country_counters.setdefault(code, {"residential": 0, "datacenter": 0, "unknown": 0})
-        kind_key = node.get("residential") if node.get("residential") in counters else "unknown"
-        counters[kind_key] += 1
-        kind = {"residential": "住宅", "datacenter": "机房", "unknown": "未知"}[kind_key]
-        entry = edge_hosts[index % len(edge_hosts)]
-        lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
+        lines = lines[:limit]
     return "\n".join(lines) + ("\n" if lines else "")
 
 
