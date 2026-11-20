@@ -28,6 +28,7 @@ def make_config(**overrides):
         min_success_ratio=0.0,
         max_residential_per_country=20,
         max_datacenter_per_country=10,
+        max_output_nodes=50,
     )
     values.update(overrides)
     return vpngate.Config(**values)
@@ -240,8 +241,29 @@ def test_build_nodes_text_caps_and_formats():
     text = vpngate.build_nodes_text(sample_data(), ["a.example.com:443"], cfg)
     lines = text.strip().splitlines()
     assert len(lines) == 2
-    assert lines[0].startswith("a.example.com:443#日本-住宅-01$sstp://vpn:vpn@a.opengw.net:443")
-    assert lines[1].startswith("a.example.com:443#日本-机房-01$sstp://vpn:vpn@c.opengw.net:443")
+    # 各国上限先各取 1 个，再按延迟全局排序：机房节点延迟 10 在前，住宅节点延迟 30 在后。
+    assert lines[0].startswith("a.example.com:443#日本-机房-01$sstp://vpn:vpn@c.opengw.net:443")
+    assert lines[1].startswith("a.example.com:443#日本-住宅-01$sstp://vpn:vpn@a.opengw.net:443")
+
+
+def test_build_nodes_text_keeps_top_50_by_latency():
+    nodes = [
+        {"host": f"n{lat:02d}.opengw.net", "port": 443, "residential": "unknown", "latency_ms": lat}
+        for lat in range(70, 0, -1)
+    ]
+    data = {"countries": {"JP": {"code": "JP", "name": "日本", "nodes": nodes[:35]},
+                          "US": {"code": "US", "name": "美国", "nodes": nodes[35:]}}}
+    cfg = make_config(max_residential_per_country=100, max_datacenter_per_country=100)
+    text = vpngate.build_nodes_text(data, ["a.example.com:443"], cfg)
+    lines = text.strip().splitlines()
+    assert len(lines) == 50
+    # 行按延迟升序：host 编号即延迟值，首行 n01、末行 n50。
+    assert "n01.opengw.net" in lines[0]
+    assert "n50.opengw.net" in lines[-1]
+    assert "n51.opengw.net" not in text
+
+    cfg3 = make_config(max_residential_per_country=100, max_datacenter_per_country=100, max_output_nodes=3)
+    assert len(vpngate.build_nodes_text(data, ["a.example.com:443"], cfg3).strip().splitlines()) == 3
 
 
 def test_build_nodes_text_sanitizes_remark_and_dedupes_links():
