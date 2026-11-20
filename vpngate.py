@@ -271,7 +271,6 @@ def derive_nodes_url() -> str:
 
 @dataclass(frozen=True)
 class Config:
-    vg_history_info_url: str
     worker_base: str
     concurrency: int
     check_timeout: float
@@ -286,6 +285,7 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
+    vg_history_info_url: str = DEFAULT_VG_HISTORY_INFO_URL
     vpngate_api: str = ""
     vpngate_mirror: str = ""
 
@@ -305,18 +305,13 @@ class Config:
         if not edge_hosts:
             edge_hosts = [h for h in (normalize_endpoint(x) for x in DEFAULT_EDGE_HOSTS) if h]
 
-        env_api = os.environ.get("VPNGATE_API", "").strip()
-        env_mirror = os.environ.get("VPNGATE_MIRROR", "").strip()
         info_url = (
             os.environ.get("VG_HISTORY_INFO_URL", "").strip()
             or os.environ.get("VPNGATE_HISTORY_INFO_URL", "").strip()
-            or env_api
-            or env_mirror
             or DEFAULT_VG_HISTORY_INFO_URL
         )
 
         return cls(
-            vg_history_info_url=info_url,
             worker_base=worker_base,
             concurrency=_env_int("CHECK_CONCURRENCY", 32, minimum=1),
             check_timeout=_env_float("CHECK_TIMEOUT", 25.0, minimum=1.0),
@@ -331,8 +326,9 @@ class Config:
             min_success_ratio=_env_float("MIN_SUCCESS_RATIO", 0.0, minimum=0.0),
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
-            vpngate_api=env_api,
-            vpngate_mirror=env_mirror,
+            vg_history_info_url=info_url,
+            vpngate_api=os.environ.get("VPNGATE_API", "").strip(),
+            vpngate_mirror=os.environ.get("VPNGATE_MIRROR", "").strip(),
         )
 
 
@@ -394,6 +390,22 @@ def _validate_history_entry(entry: Any, index: int) -> tuple[str, str]:
 
 
 def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str, Any]], str]:
+    # 本地集成测试若仅设置了 VPNGATE_API 且未设置 VG_HISTORY_INFO_URL，则直接读取对应 CSV 测试端点
+    if cfg.vpngate_api and not os.environ.get("VG_HISTORY_INFO_URL", "").strip():
+        log("VPN GATE", f"获取历史 CSV 数据源: {cfg.vpngate_api}")
+        try:
+            resp = session.get(cfg.vpngate_api, timeout=cfg.http_timeout)
+            resp.raise_for_status()
+            if not resp.encoding:
+                resp.encoding = "utf-8"
+            rows = parse_csv(resp.text)
+        except Exception as exc:  # noqa: BLE001
+            die("VPN GATE", f"获取或解析 CSV 数据源失败 ({cfg.vpngate_api}): {exc}")
+        log("VPN GATE", f"成功获取历史 CSV 文件数: 1/1，总节点数: {len(rows)}")
+        if not rows:
+            die("VPN GATE", "历史 CSV 节点总数为 0")
+        return rows, "funcra/vg-mirror/servers_history"
+
     info_url = getattr(cfg, "vg_history_info_url", "") or DEFAULT_VG_HISTORY_INFO_URL
     log("VPN GATE", f"获取历史索引: {info_url}")
     try:
