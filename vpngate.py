@@ -51,26 +51,14 @@ DEFAULT_VG_HISTORY_INFO_URL = (
 )
 DEFAULT_OPTIMAL_API = ""
 
-# 仅保留美国、日本、新加坡、泰国
-DEFAULT_ALLOWED_COUNTRY_CODES = frozenset({"US", "JP", "SG", "TH"})
+# 排除俄罗斯（RU）
+DEFAULT_BLOCKED_COUNTRY_CODES = frozenset({"RU"})
 COUNTRY_NAME_TO_CODE = {
-    "US": "US",
-    "USA": "US",
-    "UNITED STATES": "US",
-    "UNITED STATES OF AMERICA": "US",
-    "美国": "US",
-    "JP": "JP",
-    "JPN": "JP",
-    "JAPAN": "JP",
-    "日本": "JP",
-    "SG": "SG",
-    "SGP": "SG",
-    "SINGAPORE": "SG",
-    "新加坡": "SG",
-    "TH": "TH",
-    "THA": "TH",
-    "THAILAND": "TH",
-    "泰国": "TH",
+    "RU": "RU",
+    "RUS": "RU",
+    "RUSSIA": "RU",
+    "RUSSIAN FEDERATION": "RU",
+    "俄罗斯": "RU",
 }
 
 # 占位符检测：命中任意一个就认为用户还没配置
