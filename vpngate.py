@@ -66,11 +66,7 @@ PLACEHOLDER_MARKERS = ("你的", "YOUR_", "YOUR-", "example.com", "yourdomain")
 
 # 静态优选域名池（可用 EDGE_HOSTS 整体覆盖）
 DEFAULT_EDGE_HOSTS = [
-    "cdn.ctn32.us.kg:443",
-    "tt.78607323.xyz:443", 
-    "cf.nyanya.moe:443", 
-    "registry.npmjs.org:443", 
-    "registry.npmjs.org:443", 
+    "cdn.ctn32.us.kg:443"
 ]
 
 DATA_CENTER_ORG_KEYWORDS = [
