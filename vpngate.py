@@ -6,8 +6,8 @@
   2. 只保留带 TCP 入口且未被排除（默认排除俄罗斯 RU）的 SSTP 节点
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
-  5. 合并静态优选 IP 与优选 API 端点
-  6. 生成 public/data.json + public/index.html + public/nodes.txt（默认限定前 50 个节点）
+  5. 合并静态优选域名与优选 API 端点
+  6. 生成 public/data.json + public/index.html + public/nodes.txt
 
 配置全部来自环境变量。模板仓库约定：用户只需在仓库里配置 Secret `DOMAIN`，
 工作流会拼出检测地址；本地运行时可以直接设置 CHECK_WORKER。
@@ -50,7 +50,6 @@ DEFAULT_VG_HISTORY_INFO_URL = (
     "https://raw.githubusercontent.com/funcra/vg-mirror/main/servers_history/info.json"
 )
 DEFAULT_OPTIMAL_API = ""
-DEFAULT_MAX_OUTPUT_NODES = 50
 
 # 排除俄罗斯（RU）
 DEFAULT_BLOCKED_COUNTRY_CODES = frozenset({"RU"})
@@ -65,58 +64,22 @@ COUNTRY_NAME_TO_CODE = {
 # 占位符检测：命中任意一个就认为用户还没配置
 PLACEHOLDER_MARKERS = ("你的", "YOUR_", "YOUR-", "example.com", "yourdomain")
 
-# 静态优选 IP 池（可用 EDGE_HOSTS / HOSTS_ENTRY 整体覆盖）
+# 静态优选域名池（可用 EDGE_HOSTS 整体覆盖）
 DEFAULT_EDGE_HOSTS = [
-    "104.16.27.179:443",
-    "104.16.59.119:443",
-    "104.16.184.120:443",
-    "104.18.139.155:443",
-    "104.16.155.112:443",
-    "104.16.157.203:443",
-    "104.16.254.197:443",
-    "104.16.167.208:443",
-    "104.18.66.244:443",
-    "104.18.197.91:443",
-    "104.19.90.99:443",
-    "162.159.237.133:443",
-    "104.16.66.107:443",
-    "104.16.185.89:443",
-    "104.16.190.159:443",
-    "104.16.229.5:443",
-    "104.17.4.117:443",
-    "104.17.30.242:443",
-    "104.19.224.50:443",
-    "172.65.222.194:443",
-    "104.16.198.41:443",
-    "104.16.149.49:443",
-    "104.18.54.41:443",
-    "104.19.44.17:443",
-    "104.19.60.101:443",
-    "141.101.121.226:443",
-    "162.159.240.207:443",
-    "162.159.250.138:443",
-    "172.64.67.163:443",
-    "104.16.22.135:443",
-    "104.16.44.111:443",
-    "104.16.141.252:443",
-    "104.16.158.39:443",
-    "104.18.244.114:443",
-    "104.16.23.242:443",
-    "104.16.24.66:443",
-    "104.16.64.234:443",
-    "104.18.70.139:443",
-    "104.18.173.24:443",
-    "104.19.13.157:443",
-    "104.19.3.209:443",
-    "104.19.12.149:443",
-    "104.19.193.32:443",
-    "104.21.225.212:443",
-    "172.65.238.182:443",
-    "66.235.200.164:443",
-    "104.16.223.176:443",
-    "104.16.228.3:443",
-    "104.16.246.60:443",
-    "104.17.0.234:443",
+    "saas.sin.fan:443",
+    "www.mfyx.cn:443",
+    "cf.nyanya.moe:443",
+    "cf.877774.xyz:443",
+    "cdn.204910.best:443",
+    "cdn.ctn32.us.kg:443",
+    "p.etime.vip:443",
+    "cmcc.vvvv.ee:443",
+    "cfsaas.080112.xyz:443",
+    "cdn.aneko.ink:443",
+    "hk.cf.3666888.xyz:443",
+    "best.hzample.kdns.fr:443",
+    "ctsg.cfyx.aliyun.20237737.xyz:443",
+    "china-unicom.cname.cloudflare.468123.xyz:443",
 ]
 
 DATA_CENTER_ORG_KEYWORDS = [
@@ -375,7 +338,6 @@ class Config:
     vpngate_api: str = ""
     vpngate_mirror: str = ""
     blocked_countries: frozenset[str] = DEFAULT_BLOCKED_COUNTRY_CODES
-    max_output_nodes: int = DEFAULT_MAX_OUTPUT_NODES
 
     @classmethod
     def load(cls) -> "Config":
@@ -418,7 +380,6 @@ class Config:
             vpngate_api=os.environ.get("VPNGATE_API", "").strip(),
             vpngate_mirror=os.environ.get("VPNGATE_MIRROR", "").strip(),
             blocked_countries=parse_blocked_countries(os.environ.get("BLOCKED_COUNTRIES")),
-            max_output_nodes=_env_int("MAX_OUTPUT_NODES", DEFAULT_MAX_OUTPUT_NODES, minimum=0),
         )
 
 
@@ -1049,10 +1010,6 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
             entry = edge_hosts[index % len(edge_hosts)]
             index += 1
             lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
-
-    limit = getattr(cfg, "max_output_nodes", DEFAULT_MAX_OUTPUT_NODES)
-    if limit > 0:
-        lines = lines[:limit]
     return "\n".join(lines) + ("\n" if lines else "")
 
 
