@@ -2,7 +2,7 @@
 """VPN Gate SSTP 节点检测流水线（模板仓库）。
 
 流程:
-  1. 抓取 VPN Gate 原始节点（官方 API，失败回退 GitHub 镜像）
+  1. 从 funcra/vg-mirror/servers_history/info.json 动态获取全部历史 CSV 节点
   2. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import os
+import posixpath
 import re
 import sys
 import time
@@ -46,10 +47,15 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SCHEMA_VERSION = 1
 
-# VPN Gate 没有 HTTPS 接口，官方 API 只提供 HTTP。
-DEFAULT_VPNGATE_API = "http://www.vpngate.net/api/iphone/"
-DEFAULT_VPNGATE_MIRROR = (
-    "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json"
+DEFAULT_VG_HISTORY_INFO_URL = (
+    "https://raw.githubusercontent.com/funcra/vg-mirror/main/servers_history/info.json"
+)
+ALLOWED_HISTORY_HOSTS = frozenset(
+    {
+        "raw.githubusercontent.com",
+        "media.githubusercontent.com",
+        "github.com",
+    }
 )
 DEFAULT_OPTIMAL_API = ""
 
@@ -273,8 +279,7 @@ def derive_nodes_url() -> str:
 
 @dataclass(frozen=True)
 class Config:
-    vpngate_api: str
-    vpngate_mirror: str
+    vg_history_info_url: str
     worker_base: str
     concurrency: int
     check_timeout: float
@@ -306,9 +311,14 @@ class Config:
         if not edge_hosts:
             edge_hosts = [h for h in (normalize_endpoint(x) for x in DEFAULT_EDGE_HOSTS) if h]
 
+        info_url = (
+            os.environ.get("VG_HISTORY_INFO_URL", "").strip()
+            or os.environ.get("VPNGATE_HISTORY_INFO_URL", "").strip()
+            or DEFAULT_VG_HISTORY_INFO_URL
+        )
+
         return cls(
-            vpngate_api=os.environ.get("VPNGATE_API", DEFAULT_VPNGATE_API),
-            vpngate_mirror=os.environ.get("VPNGATE_MIRROR", DEFAULT_VPNGATE_MIRROR),
+            vg_history_info_url=info_url,
             worker_base=worker_base,
             concurrency=_env_int("CHECK_CONCURRENCY", 32, minimum=1),
             check_timeout=_env_float("CHECK_TIMEOUT", 25.0, minimum=1.0),
@@ -354,30 +364,106 @@ def make_session(pool_size: int = 32, retries: int = 2) -> requests.Session:
 # ---------------------------------------------------------------------------
 # 数据抓取与解析
 # ---------------------------------------------------------------------------
+def _validate_history_entry(entry: Any, index: int) -> tuple[str, str]:
+    if not isinstance(entry, dict):
+        raise ValueError(f"historical[{index}] 不是对象")
+
+    raw_name = entry.get("filename")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError(f"historical[{index}] 缺少有效的 filename")
+    filename = raw_name.strip()
+    if (
+        "/" in filename
+        or "\\" in filename
+        or ".." in filename
+        or not re.fullmatch(r"[A-Za-z0-9._-]+\.csv", filename, flags=re.IGNORECASE)
+    ):
+        raise ValueError(f"historical[{index}] filename 非法: {filename!r}")
+
+    raw_url = entry.get("url")
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise ValueError(f"historical[{index}] ({filename}) 缺少有效的 url")
+    url = raw_url.strip()
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"historical[{index}] ({filename}) URL 协议不受支持: {url!r}")
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_HISTORY_HOSTS:
+        raise ValueError(f"historical[{index}] ({filename}) URL 域名不在允许列表: {host!r}")
+    norm_path = posixpath.normpath(parsed.path or "")
+    path_parts = [part for part in norm_path.split("/") if part]
+    if "servers_history" not in path_parts or not path_parts or path_parts[-1] != filename:
+        raise ValueError(
+            f"historical[{index}] ({filename}) URL 路径不符合 servers_history 预期: {parsed.path!r}"
+        )
+
+    return filename, url
+
+
 def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str, Any]], str]:
+    log("VPN GATE", f"获取历史索引: {cfg.vg_history_info_url}")
     try:
-        log("VPN GATE", f"获取官方 API: {cfg.vpngate_api}")
-        resp = session.get(cfg.vpngate_api, timeout=cfg.http_timeout)
+        resp = session.get(cfg.vg_history_info_url, timeout=cfg.http_timeout)
         resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:  # noqa: BLE001 - 需要降级到镜像
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        die("VPN GATE", f"请求 info.json 失败 ({cfg.vg_history_info_url}): {exc}")
 
     try:
-        log("VPN GATE", f"回退镜像: {cfg.vpngate_mirror}")
-        resp = session.get(cfg.vpngate_mirror, timeout=cfg.http_timeout)
-        resp.raise_for_status()
-        rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
+        info_data = resp.json()
     except Exception as exc:  # noqa: BLE001
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN GATE", "官方 API 与回退镜像均不可用，数据源完全失败")
+        die("VPN GATE", f"解析 info.json 失败，JSON 格式错误: {exc}")
+
+    if not isinstance(info_data, dict) or "historical" not in info_data:
+        die("VPN GATE", "info.json 缺少 'historical' 字段或结构不是 JSON 对象")
+
+    historical = info_data.get("historical")
+    if not isinstance(historical, list) or len(historical) == 0:
+        die("VPN GATE", "info.json 中的 'historical' 为空或不是非空数组")
+
+    validated_entries: list[tuple[str, str]] = []
+    for idx, item in enumerate(historical):
+        try:
+            validated_entries.append(_validate_history_entry(item, idx))
+        except ValueError as exc:
+            die("VPN GATE", f"索引条目校验失败: {exc}")
+
+    log("VPN GATE", f"索引包含 {len(validated_entries)} 个历史 CSV 文件，开始逐一下载并解析")
+
+    merged_rows: list[dict[str, Any]] = []
+    success_files = 0
+
+    for filename, file_url in validated_entries:
+        try:
+            csv_resp = session.get(file_url, timeout=cfg.http_timeout)
+            csv_resp.raise_for_status()
+            if not csv_resp.encoding:
+                csv_resp.encoding = "utf-8"
+            csv_text = csv_resp.text
+        except Exception as exc:  # noqa: BLE001
+            die("VPN GATE", f"下载历史 CSV 失败 [文件: {filename}, URL: {file_url}]: {exc}")
+
+        try:
+            file_rows = parse_csv(csv_text)
+        except Exception as exc:  # noqa: BLE001
+            die("VPN GATE", f"解析历史 CSV 失败 [文件: {filename}]: {exc}")
+
+        success_files += 1
+        merged_rows.extend(file_rows)
+        log("VPN GATE", f"已解析 {filename}: {len(file_rows)} 个节点")
+
+    log(
+        "VPN GATE",
+        f"成功获取历史 CSV 文件数: {success_files}/{len(validated_entries)}，总节点数: {len(merged_rows)}",
+    )
+    if success_files != len(validated_entries):
+        die(
+            "VPN GATE",
+            f"历史 CSV 未全部获取成功（成功 {success_files}/{len(validated_entries)}），拒绝继续",
+        )
+    if not merged_rows:
+        die("VPN GATE", f"已获取 {success_files} 个历史 CSV 文件，但节点总数为 0")
+
+    return merged_rows, "funcra/vg-mirror/servers_history"
 
 
 def parse_csv(text: str) -> list[dict[str, Any]]:
@@ -446,50 +532,6 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
                 "config_b64": cell(idx_config),
                 "ping": to_int(idx_ping),
                 "score": to_int(idx_score),
-            }
-        )
-    return rows
-
-
-def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
-    servers: list[dict[str, Any]] = []
-    items = data if isinstance(data, list) else [data]
-    for item in items:
-        if isinstance(item, dict) and isinstance(item.get("servers"), list):
-            servers.extend(item["servers"])
-        elif isinstance(item, dict) and item.get("hostname"):
-            servers.append(item)
-
-    rows: list[dict[str, Any]] = []
-    for server in servers:
-        if not isinstance(server, dict):
-            continue
-        host = str(server.get("hostname") or server.get("host") or "").strip()
-        ip = str(server.get("ip") or "").strip()
-        if not host or not ip:
-            continue
-
-        def as_int(key: str) -> int | None:
-            try:
-                return int(str(server.get(key) or "").strip())
-            except (TypeError, ValueError):
-                return None
-
-        rows.append(
-            {
-                "host": host,
-                "ip": ip,
-                "country_long": str(
-                    server.get("countrylong") or server.get("country_long") or server.get("country") or ""
-                ).strip(),
-                "country_short": str(
-                    server.get("countryshort") or server.get("country_short") or ""
-                ).strip(),
-                "config_b64": str(
-                    server.get("openvpn_configdata_base64") or server.get("config_b64") or ""
-                ).strip(),
-                "ping": as_int("ping"),
-                "score": as_int("score"),
             }
         )
     return rows
