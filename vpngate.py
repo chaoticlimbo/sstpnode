@@ -334,6 +334,7 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
+    max_output_nodes: int = 50
     vg_history_info_url: str = DEFAULT_VG_HISTORY_INFO_URL
     vpngate_api: str = ""
     vpngate_mirror: str = ""
@@ -376,6 +377,7 @@ class Config:
             min_success_ratio=_env_float("MIN_SUCCESS_RATIO", 0.0, minimum=0.0),
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
+            max_output_nodes=_env_int("MAX_OUTPUT_NODES", 50),
             vg_history_info_url=info_url,
             vpngate_api=os.environ.get("VPNGATE_API", "").strip(),
             vpngate_mirror=os.environ.get("VPNGATE_MIRROR", "").strip(),
@@ -980,16 +982,17 @@ def build_outputs(
 
 
 def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -> str:
+    """nodes.txt：每行 `{入口}#{国家-类型-序号}$sstp://vpn:vpn@host:port`。
+
+    先按各国上限（住宅 MAX_RESIDENTIAL_PER_COUNTRY、其余
+    MAX_DATACENTER_PER_COUNTRY）各取一部分，再把所有候选节点按 Worker
+    延迟全局升序排列，只保留前 MAX_OUTPUT_NODES 个（默认 50，0 = 不限）。
+    入口从优选域名池轮询取用，备注序号按国家+类型分别计数。
+    """
     if not edge_hosts:
         raise ConfigError("优选入口池为空，无法生成 nodes.txt")
-    lines: list[str] = []
-    seen_links: set[str] = set()
-    index = 0
-    ordered = sorted(
-        data["countries"].items(),
-        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
-    )
-    for code, group in ordered:
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    for code, group in data["countries"].items():
         name = COUNTRY_ZH.get(code) or group.get("name") or code
         nodes = sorted(
             group["nodes"],
@@ -998,18 +1001,35 @@ def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -
         residential = [n for n in nodes if n.get("residential") == "residential"]
         others = [n for n in nodes if n.get("residential") != "residential"]
         chosen = residential[: cfg.max_residential_per_country] + others[: cfg.max_datacenter_per_country]
-        counters = {"residential": 0, "datacenter": 0, "unknown": 0}
         for node in chosen:
-            link = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
-            if link in seen_links:
-                continue
-            seen_links.add(link)
-            kind_key = node.get("residential") if node.get("residential") in counters else "unknown"
-            counters[kind_key] += 1
-            kind = {"residential": "住宅", "datacenter": "机房", "unknown": "未知"}[kind_key]
-            entry = edge_hosts[index % len(edge_hosts)]
-            index += 1
-            lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
+            candidates.append((code, name, node))
+    # 全局按延迟升序，只取前 N 个（延迟为空的排最后）。
+    candidates.sort(
+        key=lambda item: (
+            item[2].get("latency_ms") is None,
+            item[2].get("latency_ms") or 0,
+            item[2].get("host") or "",
+            item[2].get("port") or 0,
+        )
+    )
+    if cfg.max_output_nodes > 0:
+        candidates = candidates[: cfg.max_output_nodes]
+    lines: list[str] = []
+    seen_links: set[str] = set()
+    index = 0
+    counters: dict[tuple[str, str], int] = {}
+    for code, name, node in candidates:
+        link = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+        kind_key = node.get("residential") if node.get("residential") in ("residential", "datacenter", "unknown") else "unknown"
+        key = (code, kind_key)
+        counters[key] = counters.get(key, 0) + 1
+        kind = {"residential": "住宅", "datacenter": "机房", "unknown": "未知"}[kind_key]
+        entry = edge_hosts[index % len(edge_hosts)]
+        index += 1
+        lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[key]:02d}')}${link}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -1030,6 +1050,12 @@ def write_outputs(
     html_path = os.path.join(cfg.public_dir, "index.html")
     nodes_path = os.path.join(cfg.public_dir, "nodes.txt")
 
+    # 先生成 nodes.txt（会做延迟前 N 截断），再把实际发布数写进 data.json。
+    nodes_text = build_nodes_text(data, edge_hosts, cfg)
+    nodes_count = len([line for line in nodes_text.splitlines() if line.strip()])
+    data["stats"]["published"] = nodes_count
+    data["stats"]["output_limit"] = cfg.max_output_nodes
+
     atomic_write_text(data_path, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
     if os.path.exists(cfg.template_html):
@@ -1044,7 +1070,6 @@ def write_outputs(
             ".catch(e=>out.textContent='加载失败: '+e)</script></html>"
         )
     atomic_write_text(html_path, html)
-    nodes_text = build_nodes_text(data, edge_hosts, cfg)
     atomic_write_text(nodes_path, nodes_text)
     return data_path, html_path, nodes_path, nodes_text
 
