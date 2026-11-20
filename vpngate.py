@@ -20,7 +20,6 @@ import csv
 import io
 import json
 import os
-import posixpath
 import re
 import sys
 import time
@@ -49,13 +48,6 @@ SCHEMA_VERSION = 1
 
 DEFAULT_VG_HISTORY_INFO_URL = (
     "https://raw.githubusercontent.com/funcra/vg-mirror/main/servers_history/info.json"
-)
-ALLOWED_HISTORY_HOSTS = frozenset(
-    {
-        "raw.githubusercontent.com",
-        "media.githubusercontent.com",
-        "github.com",
-    }
 )
 DEFAULT_OPTIMAL_API = ""
 
@@ -294,6 +286,8 @@ class Config:
     min_success_ratio: float
     max_residential_per_country: int
     max_datacenter_per_country: int
+    vpngate_api: str = ""
+    vpngate_mirror: str = ""
 
     @classmethod
     def load(cls) -> "Config":
@@ -311,9 +305,13 @@ class Config:
         if not edge_hosts:
             edge_hosts = [h for h in (normalize_endpoint(x) for x in DEFAULT_EDGE_HOSTS) if h]
 
+        env_api = os.environ.get("VPNGATE_API", "").strip()
+        env_mirror = os.environ.get("VPNGATE_MIRROR", "").strip()
         info_url = (
             os.environ.get("VG_HISTORY_INFO_URL", "").strip()
             or os.environ.get("VPNGATE_HISTORY_INFO_URL", "").strip()
+            or env_api
+            or env_mirror
             or DEFAULT_VG_HISTORY_INFO_URL
         )
 
@@ -333,6 +331,8 @@ class Config:
             min_success_ratio=_env_float("MIN_SUCCESS_RATIO", 0.0, minimum=0.0),
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
+            vpngate_api=env_api,
+            vpngate_mirror=env_mirror,
         )
 
 
@@ -385,28 +385,22 @@ def _validate_history_entry(entry: Any, index: int) -> tuple[str, str]:
         raise ValueError(f"historical[{index}] ({filename}) 缺少有效的 url")
     url = raw_url.strip()
     parsed = urlsplit(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"historical[{index}] ({filename}) URL 协议不受支持: {url!r}")
-    host = (parsed.hostname or "").lower()
-    if host not in ALLOWED_HISTORY_HOSTS:
-        raise ValueError(f"historical[{index}] ({filename}) URL 域名不在允许列表: {host!r}")
-    norm_path = posixpath.normpath(parsed.path or "")
-    path_parts = [part for part in norm_path.split("/") if part]
-    if "servers_history" not in path_parts or not path_parts or path_parts[-1] != filename:
-        raise ValueError(
-            f"historical[{index}] ({filename}) URL 路径不符合 servers_history 预期: {parsed.path!r}"
-        )
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"historical[{index}] ({filename}) URL 非法: {url!r}")
+    if ".." in (parsed.path or ""):
+        raise ValueError(f"historical[{index}] ({filename}) URL 路径包含非法跳转: {parsed.path!r}")
 
     return filename, url
 
 
 def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str, Any]], str]:
-    log("VPN GATE", f"获取历史索引: {cfg.vg_history_info_url}")
+    info_url = getattr(cfg, "vg_history_info_url", "") or DEFAULT_VG_HISTORY_INFO_URL
+    log("VPN GATE", f"获取历史索引: {info_url}")
     try:
-        resp = session.get(cfg.vg_history_info_url, timeout=cfg.http_timeout)
+        resp = session.get(info_url, timeout=cfg.http_timeout)
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
-        die("VPN GATE", f"请求 info.json 失败 ({cfg.vg_history_info_url}): {exc}")
+        die("VPN GATE", f"请求 info.json 失败 ({info_url}): {exc}")
 
     try:
         info_data = resp.json()
@@ -532,6 +526,51 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
                 "config_b64": cell(idx_config),
                 "ping": to_int(idx_ping),
                 "score": to_int(idx_score),
+            }
+        )
+    return rows
+
+
+def parse_mirror_json(data: Any) -> list[dict[str, Any]]:
+    """兼容保留的结构解析辅助函数（不作为运行时数据源或回退源）。"""
+    servers: list[dict[str, Any]] = []
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("servers"), list):
+            servers.extend(item["servers"])
+        elif isinstance(item, dict) and item.get("hostname"):
+            servers.append(item)
+
+    rows: list[dict[str, Any]] = []
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        host = str(server.get("hostname") or server.get("host") or "").strip()
+        ip = str(server.get("ip") or "").strip()
+        if not host or not ip:
+            continue
+
+        def as_int(key: str) -> int | None:
+            try:
+                return int(str(server.get(key) or "").strip())
+            except (TypeError, ValueError):
+                return None
+
+        rows.append(
+            {
+                "host": host,
+                "ip": ip,
+                "country_long": str(
+                    server.get("countrylong") or server.get("country_long") or server.get("country") or ""
+                ).strip(),
+                "country_short": str(
+                    server.get("countryshort") or server.get("country_short") or ""
+                ).strip(),
+                "config_b64": str(
+                    server.get("openvpn_configdata_base64") or server.get("config_b64") or ""
+                ).strip(),
+                "ping": as_int("ping"),
+                "score": as_int("score"),
             }
         )
     return rows
