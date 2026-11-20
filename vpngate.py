@@ -215,13 +215,7 @@ def is_blocked_country(
 
 
 def normalize_worker_base(raw: str) -> str:
-    """把 CHECK_WORKER / DOMAIN 归一化成以 `sstp=vpn:vpn@` 结尾的检测地址前缀。
-
-    允许的写法：
-- https://abc.workers.dev/check?sstp=vpn:vpn@
-- abc.workers.dev                （自动补 https:// 与 /check?sstp=vpn:vpn@）
-- https://abc.workers.dev/check  （自动补查询串）
-    """
+    """把 CHECK_WORKER / DOMAIN 归一化成以 `sstp=vpn:vpn@` 结尾的检测地址前缀。"""
     value = (raw or "").strip()
     if not value:
         raise ConfigError(
@@ -330,7 +324,6 @@ class Config:
     deadline_s: float
     http_timeout: float
     max_check_nodes: int
-    publish_top_n: int
     public_dir: str
     template_html: str
     edge_hosts: tuple[str, ...]
@@ -343,6 +336,7 @@ class Config:
     vpngate_api: str = ""
     vpngate_mirror: str = ""
     blocked_countries: frozenset[str] = DEFAULT_BLOCKED_COUNTRY_CODES
+    publish_top_n: int = DEFAULT_PUBLISH_TOP_N
 
     @classmethod
     def load(cls) -> "Config":
@@ -373,7 +367,6 @@ class Config:
             deadline_s=_env_float("CHECK_DEADLINE", 1200.0, minimum=30.0),
             http_timeout=_env_float("HTTP_TIMEOUT", 60.0, minimum=5.0),
             max_check_nodes=_env_int("MAX_CHECK_NODES", 0),
-            publish_top_n=_env_int("PUBLISH_TOP_N", DEFAULT_PUBLISH_TOP_N, minimum=1),
             public_dir=os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public")),
             template_html=os.path.join(REPO_DIR, "web", "index.html"),
             edge_hosts=tuple(edge_hosts),
@@ -386,6 +379,7 @@ class Config:
             vpngate_api=os.environ.get("VPNGATE_API", "").strip(),
             vpngate_mirror=os.environ.get("VPNGATE_MIRROR", "").strip(),
             blocked_countries=parse_blocked_countries(os.environ.get("BLOCKED_COUNTRIES")),
+            publish_top_n=_env_int("PUBLISH_TOP_N", DEFAULT_PUBLISH_TOP_N, minimum=1),
         )
 
 
@@ -447,7 +441,6 @@ def _validate_history_entry(entry: Any, index: int) -> tuple[str, str]:
 
 
 def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str, Any]], str]:
-    # 本地集成测试若仅设置了 VPNGATE_API 且未设置 VG_HISTORY_INFO_URL，则直接读取对应 CSV 测试端点
     if cfg.vpngate_api and not os.environ.get("VG_HISTORY_INFO_URL", "").strip():
         log("VPN GATE", f"获取历史 CSV 数据源: {cfg.vpngate_api}")
         try:
@@ -702,7 +695,6 @@ def to_sstp_nodes(
         host = (row.get("host") or "").strip().lower()
         if not host:
             continue
-        # VPN Gate 主机名有时是 public-vpn-153，有时已是完整域名
         if "." not in host:
             host = f"{host}.opengw.net"
 
@@ -758,7 +750,7 @@ def classify_network(org: str | None, is_datacenter: bool | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 检测
+# 检测与延迟前 N 筛选
 # ---------------------------------------------------------------------------
 def _parse_valid_latency_ms(value: Any) -> float | None:
     """将 latency_ms 清洗为合法的非负有限浮点数；非法或缺失返回 None。"""
@@ -774,11 +766,79 @@ def _parse_valid_latency_ms(value: Any) -> float | None:
 
 
 def _normalize_latency_output(value: Any) -> int | float:
-    """保留整数毫秒为 int，小数毫秒保留最多两位小数的 float。"""
     latency = float(value)
     if latency.is_integer():
         return int(latency)
     return round(latency, 2)
+
+
+def select_top_latency_nodes(
+    results: Iterable[dict[str, Any]],
+    limit: int = DEFAULT_PUBLISH_TOP_N,
+) -> list[dict[str, Any]]:
+    """从检测结果中筛选成功且延迟合法的节点，按延迟升序取前 limit 个用于发布。"""
+    if limit <= 0:
+        return []
+
+    candidates: list[tuple[float, int, str, int, dict[str, Any]]] = []
+    seen_keys: set[tuple[str, int]] = set()
+    skipped_unsuccessful = 0
+    skipped_invalid_latency = 0
+    skipped_duplicate = 0
+
+    for item in results:
+        if not isinstance(item, dict):
+            skipped_invalid_latency += 1
+            continue
+
+        if item.get("success") is not True and item.get("status") != "success":
+            skipped_unsuccessful += 1
+            continue
+
+        latency = _parse_valid_latency_ms(item.get("latency_ms"))
+        if latency is None:
+            skipped_invalid_latency += 1
+            continue
+
+        host = str(item.get("host") or "").strip().lower()
+        try:
+            port = int(item.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+
+        key = (host, port)
+        if host and port > 0:
+            if key in seen_keys:
+                skipped_duplicate += 1
+                continue
+            seen_keys.add(key)
+
+        raw_score = item.get("score")
+        score_val = (
+            int(raw_score)
+            if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool)
+            else 0
+        )
+
+        cleaned = dict(item)
+        cleaned["latency_ms"] = _normalize_latency_output(latency)
+        cleaned["success"] = True
+        cleaned["status"] = "success"
+        if not cleaned.get("link") and host and port > 0:
+            cleaned["link"] = f"sstp://vpn:vpn@{host}:{port}"
+
+        candidates.append((latency, -score_val, host, port, cleaned))
+
+    candidates.sort(key=lambda tup: (tup[0], tup[1], tup[2], tup[3]))
+    selected = [tup[4] for tup in candidates[:limit]]
+
+    log(
+        "PUBLISH FILTER",
+        f"延迟有效候选 {len(candidates)} 个（跳过未成功 {skipped_unsuccessful}，"
+        f"延迟无效 {skipped_invalid_latency}，重复 {skipped_duplicate}），"
+        f"最终选取前 {len(selected)} 个发布（上限 {limit}）",
+    )
+    return selected
 
 
 def check_one(
@@ -821,7 +881,9 @@ def check_one(
         raw_latency = _parse_valid_latency_ms(payload.get("responseTime"))
         result["success"] = success
         result["status"] = "success" if success else "failed"
-        result["latency_ms"] = _normalize_latency_output(raw_latency) if (success and raw_latency is not None) else None
+        result["latency_ms"] = (
+            _normalize_latency_output(raw_latency) if (success and raw_latency is not None) else None
+        )
         result["colo"] = payload.get("colo")
         result["error"] = None if success else (
             payload.get("error") or payload.get("message") or "check failed"
@@ -905,76 +967,6 @@ def check_all(
     return results, timed_out
 
 
-def select_top_latency_nodes(
-    results: Iterable[dict[str, Any]],
-    limit: int = DEFAULT_PUBLISH_TOP_N,
-) -> list[dict[str, Any]]:
-    """从检测结果中筛选成功且延迟合法的节点，按延迟升序取前 limit 个用于发布。"""
-    if limit <= 0:
-        return []
-
-    candidates: list[tuple[float, int, str, int, tuple[str, int], dict[str, Any]]] = []
-    seen_keys: set[tuple[str, int]] = set()
-    skipped_unsuccessful = 0
-    skipped_invalid_latency = 0
-    skipped_duplicate = 0
-
-    for item in results:
-        if not isinstance(item, dict):
-            skipped_invalid_latency += 1
-            continue
-
-        if item.get("success") is not True and item.get("status") != "success":
-            skipped_unsuccessful += 1
-            continue
-
-        latency = _parse_valid_latency_ms(item.get("latency_ms"))
-        if latency is None:
-            skipped_invalid_latency += 1
-            continue
-
-        host = str(item.get("host") or "").strip().lower()
-        try:
-            port = int(item.get("port") or 0)
-        except (TypeError, ValueError):
-            port = 0
-
-        dedupe_key = (host, port)
-        if host and port > 0:
-            if dedupe_key in seen_keys:
-                skipped_duplicate += 1
-                continue
-            seen_keys.add(dedupe_key)
-
-        raw_score = item.get("score")
-        score_val = (
-            int(raw_score)
-            if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool)
-            else 0
-        )
-
-        cleaned = dict(item)
-        cleaned["latency_ms"] = _normalize_latency_output(latency)
-        cleaned["success"] = True
-        cleaned["status"] = "success"
-        if not cleaned.get("link") and host and port > 0:
-            cleaned["link"] = f"sstp://vpn:vpn@{host}:{port}"
-
-        # 排序键：(延迟升序, 分数降序, host升序, port升序)
-        candidates.append((latency, -score_val, host, port, dedupe_key, cleaned))
-
-    candidates.sort(key=lambda tup: (tup[0], tup[1], tup[2], tup[3]))
-    selected = [tup[5] for tup in candidates[:limit]]
-
-    log(
-        "PUBLISH FILTER",
-        f"延迟有效候选 {len(candidates)} 个（跳过未成功 {skipped_unsuccessful}，"
-        f"延迟无效 {skipped_invalid_latency}，重复 {skipped_duplicate}），"
-        f"最终选取前 {len(selected)} 个发布（上限 {limit}）",
-    )
-    return selected
-
-
 # ---------------------------------------------------------------------------
 # 优选入口
 # ---------------------------------------------------------------------------
@@ -1022,9 +1014,9 @@ def get_combined_edge_hosts(cfg: Config, session: requests.Session) -> list[str]
 
 
 # ---------------------------------------------------------------------------
-# 发布输出（仅发布延迟排名前 N 的节点）
+# 输出构建与发布（仅发布延迟排名前 N 的节点）
 # ---------------------------------------------------------------------------
-def _atomic_write_text(path: str, content: str) -> None:
+def atomic_write_text(path: str, content: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     tmp_path = f"{path}.tmp.{os.getpid()}"
@@ -1033,9 +1025,145 @@ def _atomic_write_text(path: str, content: str) -> None:
     os.replace(tmp_path, path)
 
 
+def _sanitize_remark_part(text: str) -> str:
+    cleaned = re.sub(r"[\r\n|#]+", " ", str(text or "")).strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def build_nodes_text(
+    results: Iterable[dict[str, Any]],
+    edge_hosts: Iterable[str],
+    cfg: Config | None = None,
+) -> str:
+    """基于延迟排名前 N 的可用节点与入口池生成 nodes.txt 内容。"""
+    pool = [ep for ep in (normalize_endpoint(str(h)) for h in edge_hosts) if ep]
+    if not pool:
+        raise ConfigError("优选入口地址池为空，无法生成 nodes.txt")
+
+    limit = cfg.publish_top_n if cfg is not None else DEFAULT_PUBLISH_TOP_N
+    selected = select_top_latency_nodes(results, limit=limit)
+
+    lines: list[str] = []
+    seen_lines: set[str] = set()
+    for idx, node in enumerate(selected, start=1):
+        host = str(node.get("host") or "").strip().lower()
+        try:
+            port = int(node.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not host or not 1 <= port <= 65535:
+            continue
+
+        raw_link = str(node.get("link") or "").strip()
+        base_link = raw_link.split("#", 1)[0].strip() if raw_link else f"sstp://vpn:vpn@{host}:{port}"
+        if not base_link:
+            continue
+
+        code = _sanitize_remark_part(node.get("country_code") or node.get("country") or "UN").upper()
+        cc_zh = COUNTRY_ZH.get(code, "")
+        latency = node.get("latency_ms")
+        lat_str = f"{latency}ms" if latency is not None else ""
+        remark_parts = [f"#{idx:02d}", cc_zh or code, f"{host}:{port}", lat_str]
+        remark = quote(" | ".join(p for p in remark_parts if p))
+
+        entry = pool[(idx - 1) % len(pool)]
+        line = f"{base_link}#{remark}" if "#" not in base_link else base_link
+        if entry:
+            sep = "&" if "?" in line else "?"
+            if "sni=" not in line and "host=" not in line:
+                line = f"{line}{sep}edge={quote(entry, safe=':[]')}"
+
+        if line not in seen_lines:
+            seen_lines.add(line)
+            lines.append(line)
+
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _group_by_country(nodes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes:
+        code = (
+            resolve_country_code(node.get("country_code"), node.get("country"))
+            or str(node.get("country_code") or node.get("country") or "UNKNOWN").upper()
+        )
+        grouped.setdefault(code, []).append(node)
+    return grouped
+
+
+def build_outputs(
+    results: Iterable[dict[str, Any]],
+    raw_count: int = 0,
+    sstp_count: int = 0,
+    unique_count: int | None = None,
+    source: str = "funcra/vg-mirror/servers_history",
+    worker_host: str = "",
+    duration_s: float = 0.0,
+    timed_out: int = 0,
+    edge_hosts: Iterable[str] = (),
+    nodes_url: str = "",
+    publish_top_n: int = DEFAULT_PUBLISH_TOP_N,
+) -> dict[str, Any]:
+    """构建发布数据字典（仅保留延迟排名前 publish_top_n 的节点与对应统计）。"""
+    all_items = [item for item in results if isinstance(item, dict)]
+    checked_count = len(all_items)
+    success_count = sum(
+        1 for item in all_items if item.get("success") is True or item.get("status") == "success"
+    )
+    failed_count = max(0, checked_count - success_count)
+
+    published_nodes = select_top_latency_nodes(all_items, limit=publish_top_n)
+    countries = _group_by_country(published_nodes)
+
+    latencies = [
+        float(n["latency_ms"])
+        for n in published_nodes
+        if _parse_valid_latency_ms(n.get("latency_ms")) is not None
+    ]
+    min_latency = _normalize_latency_output(min(latencies)) if latencies else None
+    avg_latency = (
+        _normalize_latency_output(sum(latencies) / len(latencies)) if latencies else None
+    )
+
+    effective_unique = unique_count if unique_count is not None else max(sstp_count, checked_count)
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    pool_list = [ep for ep in (normalize_endpoint(str(h)) for h in edge_hosts) if ep]
+
+    stats: dict[str, Any] = {
+        "raw_nodes": int(raw_count),
+        "sstp_nodes": int(sstp_count),
+        "unique_nodes": int(effective_unique),
+        "checked_nodes": int(checked_count),
+        "success": int(success_count),
+        "success_count": int(success_count),
+        "failed": int(failed_count),
+        "failed_count": int(failed_count),
+        "timed_out": int(timed_out),
+        "published": int(len(published_nodes)),
+        "published_count": int(len(published_nodes)),
+        "publish_limit": int(publish_top_n),
+        "min_latency_ms": min_latency,
+        "avg_latency_ms": avg_latency,
+        "duration_s": round(float(duration_s), 2),
+    }
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "updated_at": now_utc,
+        "source": source,
+        "worker_host": worker_host,
+        "nodes_url": nodes_url or derive_nodes_url(),
+        "edge_hosts": pool_list,
+        "stats": stats,
+        "countries": countries,
+        "nodes": published_nodes,
+    }
+
+
 def _render_fallback_html(payload: dict[str, Any]) -> str:
     safe_json = json.dumps(payload, ensure_ascii=False, indent=2).replace("</", "<\\/")
-    title = html.escape(f"SSTP Top {len(payload.get('nodes', []))} Nodes")
+    nodes = payload.get("nodes", [])
+    title = html.escape(f"SSTP Top {len(nodes)} Nodes")
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1053,7 +1181,7 @@ def _render_fallback_html(payload: dict[str, Any]) -> str:
 <body>
   <h1>{title}</h1>
   <p>更新时间：<span id="updated-at">{html.escape(str(payload.get("updated_at", "")))}</span> |
-     已发布节点数：<span id="published-count">{len(payload.get("nodes", []))}</span></p>
+     已发布节点数：<span id="published-count">{len(nodes)}</span></p>
   <table>
     <thead>
       <tr><th>#</th><th>延迟 (ms)</th><th>国家/地区</th><th>主机:端口</th><th>链接</th></tr>
@@ -1090,53 +1218,23 @@ def build_html_output(template_path: str, payload: dict[str, Any]) -> str:
 
 def publish_outputs(
     cfg: Config,
-    published_nodes: list[dict[str, Any]],
-    edge_hosts: list[str],
-    source_name: str,
-    total_checked: int,
-    timed_out: int,
+    payload: dict[str, Any],
+    nodes_text: str,
 ) -> None:
-    """将延迟排名前 N 的节点写入 public/data.json、public/nodes.txt 与 public/index.html。"""
+    """将构建好的发布数据写入 public/data.json、public/nodes.txt 与 public/index.html。"""
     os.makedirs(cfg.public_dir, exist_ok=True)
-    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    payload: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "updated_at": now_utc,
-        "source": source_name,
-        "publish_limit": cfg.publish_top_n,
-        "checked_total": total_checked,
-        "timed_out_count": timed_out,
-        "published_count": len(published_nodes),
-        "nodes_url": cfg.nodes_url,
-        "edge_hosts": edge_hosts,
-        "nodes": published_nodes,
-    }
-
-    links: list[str] = []
-    seen_links: set[str] = set()
-    for node in published_nodes:
-        link = str(node.get("link") or "").strip()
-        if not link:
-            host = str(node.get("host") or "").strip()
-            port = node.get("port")
-            if host and port:
-                link = f"sstp://vpn:vpn@{host}:{port}"
-        if link and link not in seen_links:
-            seen_links.add(link)
-            links.append(link)
-
     data_path = os.path.join(cfg.public_dir, "data.json")
     nodes_path = os.path.join(cfg.public_dir, "nodes.txt")
     html_path = os.path.join(cfg.public_dir, "index.html")
 
-    _atomic_write_text(data_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    _atomic_write_text(nodes_path, ("\n".join(links) + "\n") if links else "")
-    _atomic_write_text(html_path, build_html_output(cfg.template_html, payload))
+    atomic_write_text(data_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    atomic_write_text(nodes_path, nodes_text)
+    atomic_write_text(html_path, build_html_output(cfg.template_html, payload))
 
+    published_count = len(payload.get("nodes", []))
     log(
         "PUBLISH",
-        f"已发布 {len(published_nodes)} 个低延迟节点（上限 {cfg.publish_top_n}）至 {cfg.public_dir} "
+        f"已发布 {published_count} 个低延迟节点（上限 {cfg.publish_top_n}）至 {cfg.public_dir} "
         f"(data.json / nodes.txt / index.html)",
     )
 
@@ -1145,6 +1243,7 @@ def publish_outputs(
 # 主流程
 # ---------------------------------------------------------------------------
 def main() -> int:
+    started_at = time.monotonic()
     try:
         cfg = Config.load()
     except ConfigError as exc:
@@ -1153,9 +1252,12 @@ def main() -> int:
     session = make_session(pool_size=max(32, cfg.concurrency + 8), retries=2)
     try:
         rows, source_name = fetch_vpngate(cfg, session)
-        log("FILTER", f"原始节点数: {len(rows)}，排除国家: {sorted(cfg.blocked_countries)}")
+        raw_count = len(rows)
+        log("FILTER", f"原始节点数: {raw_count}，排除国家: {sorted(cfg.blocked_countries)}")
         sstp_nodes = to_sstp_nodes(rows, blocked_countries=cfg.blocked_countries)
+        sstp_count = len(sstp_nodes)
         unique_nodes = dedupe_nodes(sstp_nodes)
+        unique_count = len(unique_nodes)
         ordered_nodes = prioritize(unique_nodes)
 
         if cfg.max_check_nodes > 0:
@@ -1165,7 +1267,7 @@ def main() -> int:
 
         log(
             "FILTER",
-            f"有效 SSTP 节点: {len(sstp_nodes)}，去重后: {len(unique_nodes)}，本次待检测: {len(nodes_to_check)}",
+            f"有效 SSTP 节点: {sstp_count}，去重后: {unique_count}，本次待检测: {len(nodes_to_check)}",
         )
 
         if not nodes_to_check:
@@ -1174,20 +1276,48 @@ def main() -> int:
         log("CLOUDFLARE WORKER", f"并发检测中（并发数: {cfg.concurrency}，单节点超时: {cfg.check_timeout}s）")
         raw_results, timed_out = check_all(nodes_to_check, session, cfg)
 
-        # 只取检测成功且延迟有效、按延迟升序排名前 N（默认 50）的节点发布
+        success_count = sum(
+            1
+            for item in raw_results
+            if isinstance(item, dict) and (item.get("success") is True or item.get("status") == "success")
+        )
+        if success_count == 0:
+            die("PUBLISH", "全部节点检测失败（可用节点数为 0），拒绝发布")
+
+        if cfg.min_success_ratio > 0 and nodes_to_check:
+            ratio = success_count / len(nodes_to_check)
+            if ratio < cfg.min_success_ratio:
+                die(
+                    "PUBLISH",
+                    f"检测成功率 {ratio:.2%} 低于阈值 {cfg.min_success_ratio:.2%}，拒绝发布",
+                )
+
         published_nodes = select_top_latency_nodes(raw_results, limit=cfg.publish_top_n)
         if not published_nodes:
-            log("PUBLISH FILTER", "警告：本次检测没有延迟有效的成功节点，将发布空列表")
+            die("PUBLISH", "没有延迟有效的成功节点可供发布，拒绝发布")
 
         edge_hosts = get_combined_edge_hosts(cfg, session)
-        publish_outputs(
-            cfg=cfg,
-            published_nodes=published_nodes,
-            edge_hosts=edge_hosts,
-            source_name=source_name,
-            total_checked=len(nodes_to_check),
+        try:
+            nodes_text = build_nodes_text(published_nodes, edge_hosts, cfg)
+        except ConfigError as exc:
+            die("PUBLISH", str(exc))
+
+        duration_s = time.monotonic() - started_at
+        worker_host = urlsplit(cfg.worker_base).netloc
+        payload = build_outputs(
+            results=published_nodes,
+            raw_count=raw_count,
+            sstp_count=sstp_count,
+            unique_count=unique_count,
+            source=source_name,
+            worker_host=worker_host,
+            duration_s=duration_s,
             timed_out=timed_out,
+            edge_hosts=edge_hosts,
+            nodes_url=cfg.nodes_url,
+            publish_top_n=cfg.publish_top_n,
         )
+        publish_outputs(cfg=cfg, payload=payload, nodes_text=nodes_text)
         return 0
     finally:
         session.close()
