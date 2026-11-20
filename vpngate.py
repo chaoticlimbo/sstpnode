@@ -3,7 +3,7 @@
 
 流程:
   1. 从 funcra/vg-mirror/servers_history/info.json 动态获取全部历史 CSV 节点
-  2. 只保留带 TCP 入口且属于目标国家/地区（默认美国、日本、新加坡）的 SSTP 节点
+  2. 只保留带 TCP 入口且属于目标国家/地区（默认美国、日本、新加坡、泰国）的 SSTP 节点
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
   5. 合并静态优选域名与优选 API 端点
@@ -20,7 +20,6 @@ import csv
 import io
 import json
 import os
-import posixpath
 import re
 import sys
 import time
@@ -52,8 +51,8 @@ DEFAULT_VG_HISTORY_INFO_URL = (
 )
 DEFAULT_OPTIMAL_API = ""
 
-# 仅保留美国、日本、新加坡
-DEFAULT_ALLOWED_COUNTRY_CODES = frozenset({"US", "JP", "SG"})
+# 仅保留美国、日本、新加坡、泰国
+DEFAULT_ALLOWED_COUNTRY_CODES = frozenset({"US", "JP", "SG", "TH"})
 COUNTRY_NAME_TO_CODE = {
     "US": "US",
     "USA": "US",
@@ -68,6 +67,10 @@ COUNTRY_NAME_TO_CODE = {
     "SGP": "SG",
     "SINGAPORE": "SG",
     "新加坡": "SG",
+    "TH": "TH",
+    "THA": "TH",
+    "THAILAND": "TH",
+    "泰国": "TH",
 }
 
 # 占位符检测：命中任意一个就认为用户还没配置
@@ -181,7 +184,7 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 
 
 def parse_allowed_countries(raw: str | None) -> frozenset[str]:
-    """解析允许的国家代码集合，默认仅美国(US)、日本(JP)、新加坡(SG)。"""
+    """解析允许的国家代码集合，默认仅美国(US)、日本(JP)、新加坡(SG)、泰国(TH)。"""
     if not raw or not raw.strip():
         return DEFAULT_ALLOWED_COUNTRY_CODES
     codes: set[str] = set()
@@ -196,7 +199,7 @@ def parse_allowed_countries(raw: str | None) -> frozenset[str]:
 
 
 def resolve_country_code(country_code: str | None, country_name: str | None = None) -> str:
-    """将国家代码或国家名称归一化为两位国家代码（如 US / JP / SG）。"""
+    """将国家代码或国家名称归一化为两位国家代码（如 US / JP / SG / TH）。"""
     code = (country_code or "").strip().upper()
     if code in COUNTRY_NAME_TO_CODE:
         return COUNTRY_NAME_TO_CODE[code]
@@ -213,7 +216,7 @@ def is_allowed_country(
     country_name: str | None = None,
     allowed_codes: Iterable[str] = DEFAULT_ALLOWED_COUNTRY_CODES,
 ) -> bool:
-    """判断节点是否属于允许的国家/地区（默认 US / JP / SG）。"""
+    """判断节点是否属于允许的国家/地区（默认 US / JP / SG / TH）。"""
     allowed = frozenset(c.upper() for c in allowed_codes)
     resolved = resolve_country_code(country_code, country_name)
     return resolved in allowed
