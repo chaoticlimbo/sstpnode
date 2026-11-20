@@ -7,7 +7,7 @@
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
   5. 合并静态优选域名与优选 API 端点
-  6. 生成 public/data.json + public/index.html + public/nodes.txt（取延迟最快的前 30 个可用节点）
+  6. 生成 public/data.json + public/index.html + public/nodes.txt
 
 配置全部来自环境变量。模板仓库约定：用户只需在仓库里配置 Secret `DOMAIN`，
 工作流会拼出检测地址；本地运行时可以直接设置 CHECK_WORKER。
@@ -50,8 +50,6 @@ DEFAULT_VG_HISTORY_INFO_URL = (
     "https://raw.githubusercontent.com/funcra/vg-mirror/main/servers_history/info.json"
 )
 DEFAULT_OPTIMAL_API = ""
-
-MAX_OUTPUT_NODES = 30
 
 # 排除俄罗斯（RU）
 DEFAULT_BLOCKED_COUNTRY_CODES = frozenset({"RU"})
@@ -927,38 +925,6 @@ def sanitize_remark(text: str) -> str:
     return re.sub(r"[#$\r\n]", "", text).strip() or "节点"
 
 
-def _latency_sort_key(node: dict[str, Any]) -> tuple[int, float, str, int]:
-    raw_lat = node.get("latency_ms")
-    try:
-        lat = float(raw_lat)
-    except (TypeError, ValueError):
-        lat = None
-    if lat is None or lat < 0:
-        return (1, float("inf"), str(node.get("host") or ""), int(node.get("port") or 0))
-    return (0, lat, str(node.get("host") or ""), int(node.get("port") or 0))
-
-
-def select_fastest_nodes(
-    available: Iterable[dict[str, Any]],
-    limit: int = MAX_OUTPUT_NODES,
-) -> list[dict[str, Any]]:
-    """从可用节点中按延迟由低到高排序，取前 limit 个（去重）。"""
-    ordered = sorted(available, key=_latency_sort_key)
-    selected: list[dict[str, Any]] = []
-    seen_links: set[str] = set()
-    for node in ordered:
-        host = str(node.get("host") or "").strip()
-        port = node.get("port")
-        link = str(node.get("link") or (f"sstp://vpn:vpn@{host}:{port}" if host and port else "")).strip()
-        if not link or link in seen_links:
-            continue
-        seen_links.add(link)
-        selected.append(node)
-        if limit > 0 and len(selected) >= limit:
-            break
-    return selected
-
-
 def build_outputs(
     results: list[dict[str, Any]],
     raw_count: int,
@@ -967,13 +933,10 @@ def build_outputs(
     worker_host: str,
     duration_s: float,
     timed_out: int,
-    max_output_nodes: int = MAX_OUTPUT_NODES,
 ) -> dict[str, Any]:
-    available_all = [r for r in results if r.get("success")]
-    selected_nodes = select_fastest_nodes(available_all, limit=max_output_nodes)
-
+    available = [r for r in results if r.get("success")]
     countries: dict[str, dict[str, Any]] = {}
-    for node in selected_nodes:
+    for node in available:
         code = (node.get("country_code") or "").upper() or "??"
         name = node.get("country") or COUNTRY_ZH.get(code) or code
         group = countries.setdefault(
@@ -988,21 +951,22 @@ def build_outputs(
         group["residential"] = sum(1 for n in group["nodes"] if n.get("residential") == "residential")
         group["datacenter"] = sum(1 for n in group["nodes"] if n.get("residential") == "datacenter")
         group["unknown"] = group["count"] - group["residential"] - group["datacenter"]
-        group["nodes"].sort(key=_latency_sort_key)
+        group["nodes"].sort(
+            key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0)
+        )
 
     stats = {
         "raw_nodes": raw_count,
         "sstp_nodes": sstp_count,
         "checked": len(results),
-        "success_total": len(available_all),
-        "success": len(selected_nodes),
-        "failed": len(results) - len(available_all),
+        "success": len(available),
+        "failed": len(results) - len(available),
         "worker_errors": sum(1 for r in results if r.get("worker_error")),
         "timed_out": timed_out,
         "countries": len(countries),
-        "residential_est": sum(1 for n in selected_nodes if n.get("residential") == "residential"),
-        "datacenter_est": sum(1 for n in selected_nodes if n.get("residential") == "datacenter"),
-        "unknown_est": sum(1 for n in selected_nodes if n.get("residential") == "unknown"),
+        "residential_est": sum(1 for n in available if n.get("residential") == "residential"),
+        "datacenter_est": sum(1 for n in available if n.get("residential") == "datacenter"),
+        "unknown_est": sum(1 for n in available if n.get("residential") == "unknown"),
     }
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1015,39 +979,37 @@ def build_outputs(
     }
 
 
-def build_nodes_text(
-    data: dict[str, Any],
-    edge_hosts: list[str],
-    cfg: Config,
-    max_output_nodes: int = MAX_OUTPUT_NODES,
-) -> str:
+def build_nodes_text(data: dict[str, Any], edge_hosts: list[str], cfg: Config) -> str:
     if not edge_hosts:
         raise ConfigError("优选入口池为空，无法生成 nodes.txt")
-
-    candidates: list[dict[str, Any]] = []
-    for group in data.get("countries", {}).values():
-        candidates.extend(group.get("nodes") or [])
-
-    selected = select_fastest_nodes(candidates, limit=max_output_nodes)
     lines: list[str] = []
     seen_links: set[str] = set()
     index = 0
-    counters = {"residential": 0, "datacenter": 0, "unknown": 0}
-
-    for node in selected:
-        code = (node.get("country_code") or "").upper() or "??"
-        name = COUNTRY_ZH.get(code) or node.get("country") or code
-        link = node.get("link") or f"sstp://vpn:vpn@{node['host']}:{node['port']}"
-        if link in seen_links:
-            continue
-        seen_links.add(link)
-        kind_key = node.get("residential") if node.get("residential") in counters else "unknown"
-        counters[kind_key] += 1
-        kind = {"residential": "住宅", "datacenter": "机房", "unknown": "未知"}[kind_key]
-        entry = edge_hosts[index % len(edge_hosts)]
-        index += 1
-        lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
-
+    ordered = sorted(
+        data["countries"].items(),
+        key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])),
+    )
+    for code, group in ordered:
+        name = COUNTRY_ZH.get(code) or group.get("name") or code
+        nodes = sorted(
+            group["nodes"],
+            key=lambda n: (n.get("residential") != "residential", n.get("latency_ms") is None, n.get("latency_ms") or 0),
+        )
+        residential = [n for n in nodes if n.get("residential") == "residential"]
+        others = [n for n in nodes if n.get("residential") != "residential"]
+        chosen = residential[: cfg.max_residential_per_country] + others[: cfg.max_datacenter_per_country]
+        counters = {"residential": 0, "datacenter": 0, "unknown": 0}
+        for node in chosen:
+            link = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            kind_key = node.get("residential") if node.get("residential") in counters else "unknown"
+            counters[kind_key] += 1
+            kind = {"residential": "住宅", "datacenter": "机房", "unknown": "未知"}[kind_key]
+            entry = edge_hosts[index % len(edge_hosts)]
+            index += 1
+            lines.append(f"{entry}#{sanitize_remark(f'{name}-{kind}-{counters[kind_key]:02d}')}${link}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 
@@ -1097,7 +1059,7 @@ def write_step_summary(data: dict[str, Any], nodes_count: int, cfg: Config) -> N
         f"| 原始节点 | {stats['raw_nodes']} |\n",
         f"| SSTP 候选 | {stats['sstp_nodes']} |\n",
         f"| 已检测 | {stats['checked']} |\n",
-        f"| 可用（输出前 {MAX_OUTPUT_NODES}） | {stats['success']} |\n",
+        f"| 可用 | {stats['success']} |\n",
         f"| 失败 | {stats['failed']}（Worker 异常 {stats['worker_errors']}）|\n",
         f"| 国家/地区 | {stats['countries']} |\n",
         f"| 住宅 / 机房 / 未知 | {stats['residential_est']} / {stats['datacenter_est']} / {stats['unknown_est']} |\n",
@@ -1129,7 +1091,6 @@ def main() -> None:
     log("CONFIG", f"检测地址: {cfg.worker_base.rsplit('?', 1)[0]}?sstp=***")
     log("CONFIG", f"并发 {cfg.concurrency}, 单节点超时 {cfg.check_timeout}s, 整体截止 {cfg.deadline_s}s")
     log("CONFIG", f"排除国家/地区: {', '.join(sorted(cfg.blocked_countries)) or '无'}")
-    log("CONFIG", f"输出节点上限: 延迟最快前 {MAX_OUTPUT_NODES} 个")
 
     rows, source = fetch_vpngate(cfg, session)
     raw_count = len(rows)
@@ -1189,7 +1150,7 @@ def main() -> None:
     edge_hosts = get_combined_edge_hosts(cfg, session)
     data_path, html_path, nodes_path, nodes_text = write_outputs(data, cfg, edge_hosts)
     nodes_count = len([line for line in nodes_text.splitlines() if line.strip()])
-    log("RESULT", f"输出节点 {data['stats']['success']}（共可用 {data['stats']['success_total']}）, 国家/地区 {data['stats']['countries']}, nodes.txt {nodes_count} 行")
+    log("RESULT", f"可用节点 {data['stats']['success']}, 国家/地区 {data['stats']['countries']}, nodes.txt {nodes_count} 行")
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
