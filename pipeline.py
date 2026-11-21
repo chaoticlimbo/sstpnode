@@ -3,11 +3,11 @@
 流程：
   1. 收集：从节点池（GeorgeXie2333/vpngate-list-mirror 的 pool/servers.json）
      拉取全部节点，取带 TCP 探测端口的条目，转成 SSTP 链接、去重，
-     写 node-collect.txt（一行一个 sstp:// 链接）。
-  2. 检测：读仓库里的 node-origin.txt（人工维护的待测名单，一行一个节点，
-     本流水线只读不改），逐个送 check.socks5.lzjbaby.com 检测，
-     每个节点的完整检测结果一行一条 JSON 写 node-tests.txt，
-     与待测名单的顺序一一对应。
+     写 node-collect.txt（一行一个 sstp:// 链接），并用同一份名单
+     更新 node-origin.txt（每次运行都由节点池刷新，不是独立输入文件）。
+  2. 检测：读 node-origin.txt（即第 1 步刚更新的名单），逐个送
+     check.socks5.lzjbaby.com 检测，每个节点的完整检测结果一行一条
+     JSON 写 node-tests.txt，与 node-origin.txt 的顺序一一对应。
   3. 成品：检测通过（success 为真）的节点写 node.txt，
      纯 sstp:// 一行一个，不限数量，按检测延迟 responseTime 升序。
 
@@ -406,11 +406,10 @@ def main() -> int:
         return 2
     atomic_write_text(cfg.collect_file, join_lines(collect_lines))
     log("POOL", f"已写 {cfg.collect_file}（{len(collect_lines)} 行）")
+    atomic_write_text(cfg.origin_file, join_lines(collect_lines))
+    log("POOL", f"已用同一份名单更新 {cfg.origin_file}（{len(collect_lines)} 行）")
 
     # ---- 第 2 步：检测 ----
-    if not os.path.exists(cfg.origin_file):
-        log("ORIGIN", f"待测名单不存在: {cfg.origin_file}")
-        return 2
     with open(cfg.origin_file, encoding="utf-8", errors="replace") as fh:
         origin_text = fh.read()
     origin_nodes, bad_lines = parse_origin_text(origin_text)
