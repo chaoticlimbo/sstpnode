@@ -2,7 +2,7 @@
 """VPN Gate SSTP 节点检测流水线（模板仓库）。
 
 流程:
-  1. 从 funcra/vg-mirror/servers_history/info.json 动态获取全部历史 CSV 节点
+  1. 从 GeorgeXie2333/vpngate-list-mirror 的 pool/servers.json 获取全部节点
   2. 只保留带 TCP 入口且未被排除（默认排除俄罗斯 RU）的 SSTP 节点
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
@@ -46,9 +46,7 @@ REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 SCHEMA_VERSION = 1
 
-DEFAULT_VG_HISTORY_INFO_URL = (
-    "https://raw.githubusercontent.com/funcra/vg-mirror/main/servers_history/info.json"
-)
+DEFAULT_POOL_URL = "https://raw.githubusercontent.com/GeorgeXie2333/vpngate-list-mirror/main/pool/servers.json"
 DEFAULT_OPTIMAL_API = ""
 
 # 排除俄罗斯（RU）
@@ -322,7 +320,7 @@ class Config:
     max_residential_per_country: int
     max_datacenter_per_country: int
     max_output_nodes: int = 50
-    vg_history_info_url: str = DEFAULT_VG_HISTORY_INFO_URL
+    pool_url: str = DEFAULT_POOL_URL
     vpngate_api: str = ""
     vpngate_mirror: str = ""
     blocked_countries: frozenset[str] = DEFAULT_BLOCKED_COUNTRY_CODES
@@ -343,12 +341,6 @@ class Config:
         if not edge_hosts:
             edge_hosts = [h for h in (normalize_endpoint(x) for x in DEFAULT_EDGE_HOSTS) if h]
 
-        info_url = (
-            os.environ.get("VG_HISTORY_INFO_URL", "").strip()
-            or os.environ.get("VPNGATE_HISTORY_INFO_URL", "").strip()
-            or DEFAULT_VG_HISTORY_INFO_URL
-        )
-
         return cls(
             worker_base=worker_base,
             concurrency=_env_int("CHECK_CONCURRENCY", 32, minimum=1),
@@ -365,7 +357,7 @@ class Config:
             max_residential_per_country=_env_int("MAX_RESIDENTIAL_PER_COUNTRY", 20),
             max_datacenter_per_country=_env_int("MAX_DATACENTER_PER_COUNTRY", 10),
             max_output_nodes=_env_int("MAX_OUTPUT_NODES", 50),
-            vg_history_info_url=info_url,
+            pool_url=os.environ.get("POOL_URL", "").strip() or DEFAULT_POOL_URL,
             vpngate_api=os.environ.get("VPNGATE_API", "").strip(),
             vpngate_mirror=os.environ.get("VPNGATE_MIRROR", "").strip(),
             blocked_countries=parse_blocked_countries(os.environ.get("BLOCKED_COUNTRIES")),
@@ -400,116 +392,82 @@ def make_session(pool_size: int = 32, retries: int = 2) -> requests.Session:
 # ---------------------------------------------------------------------------
 # 数据抓取与解析
 # ---------------------------------------------------------------------------
-def _validate_history_entry(entry: Any, index: int) -> tuple[str, str]:
-    if not isinstance(entry, dict):
-        raise ValueError(f"historical[{index}] 不是对象")
-
-    raw_name = entry.get("filename")
-    if not isinstance(raw_name, str) or not raw_name.strip():
-        raise ValueError(f"historical[{index}] 缺少有效的 filename")
-    filename = raw_name.strip()
-    if (
-        "/" in filename
-        or "\\" in filename
-        or ".." in filename
-        or not re.fullmatch(r"[A-Za-z0-9._-]+\.csv", filename, flags=re.IGNORECASE)
-    ):
-        raise ValueError(f"historical[{index}] filename 非法: {filename!r}")
-
-    raw_url = entry.get("url")
-    if not isinstance(raw_url, str) or not raw_url.strip():
-        raise ValueError(f"historical[{index}] ({filename}) 缺少有效的 url")
-    url = raw_url.strip()
-    parsed = urlsplit(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError(f"historical[{index}] ({filename}) URL 非法: {url!r}")
-    if ".." in (parsed.path or ""):
-        raise ValueError(f"historical[{index}] ({filename}) URL 路径包含非法跳转: {parsed.path!r}")
-
-    return filename, url
-
-
 def fetch_vpngate(cfg: Config, session: requests.Session) -> tuple[list[dict[str, Any]], str]:
-    # 本地集成测试若仅设置了 VPNGATE_API 且未设置 VG_HISTORY_INFO_URL，则直接读取对应 CSV 测试端点
-    if cfg.vpngate_api and not os.environ.get("VG_HISTORY_INFO_URL", "").strip():
-        log("VPN GATE", f"获取历史 CSV 数据源: {cfg.vpngate_api}")
-        try:
-            resp = session.get(cfg.vpngate_api, timeout=cfg.http_timeout)
-            resp.raise_for_status()
-            if not resp.encoding:
-                resp.encoding = "utf-8"
-            rows = parse_csv(resp.text)
-        except Exception as exc:  # noqa: BLE001
-            die("VPN GATE", f"获取或解析 CSV 数据源失败 ({cfg.vpngate_api}): {exc}")
-        log("VPN GATE", f"成功获取历史 CSV 文件数: 1/1，总节点数: {len(rows)}")
-        if not rows:
-            die("VPN GATE", "历史 CSV 节点总数为 0")
-        return rows, "funcra/vg-mirror/servers_history"
-
-    info_url = getattr(cfg, "vg_history_info_url", "") or DEFAULT_VG_HISTORY_INFO_URL
-    log("VPN GATE", f"获取历史索引: {info_url}")
+    pool_url = getattr(cfg, "pool_url", "") or DEFAULT_POOL_URL
+    log("VPN GATE", f"获取节点池: {pool_url}")
     try:
-        resp = session.get(info_url, timeout=cfg.http_timeout)
+        resp = session.get(pool_url, timeout=cfg.http_timeout)
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
-        die("VPN GATE", f"请求 info.json 失败 ({info_url}): {exc}")
+        die("VPN GATE", f"请求节点池失败 ({pool_url}): {exc}")
 
     try:
-        info_data = resp.json()
+        pool_data = resp.json()
     except Exception as exc:  # noqa: BLE001
-        die("VPN GATE", f"解析 info.json 失败，JSON 格式错误: {exc}")
+        die("VPN GATE", f"解析节点池失败，JSON 格式错误: {exc}")
 
-    if not isinstance(info_data, dict) or "historical" not in info_data:
-        die("VPN GATE", "info.json 缺少 'historical' 字段或结构不是 JSON 对象")
+    rows = parse_pool_json(pool_data)
+    log("VPN GATE", f"节点池总节点数: {len(rows)}")
+    if not rows:
+        die("VPN GATE", "节点池节点总数为 0")
+    return rows, "GeorgeXie2333/vpngate-list-mirror/pool"
 
-    historical = info_data.get("historical")
-    if not isinstance(historical, list) or len(historical) == 0:
-        die("VPN GATE", "info.json 中的 'historical' 为空或不是非空数组")
 
-    validated_entries: list[tuple[str, str]] = []
-    for idx, item in enumerate(historical):
+def parse_pool_json(data: Any) -> list[dict[str, Any]]:
+    """解析 GeorgeXie2333/vpngate-list-mirror 的 pool/servers.json。
+
+    顶层是对象时取 servers 数组，本身是数组时直接当 servers。
+    输出与 parse_csv 相同的字段，并额外带 port（来自 probe_targets，
+    TCP 探测目标的端口即 SSTP 端口；UDP 条目没有 probe_targets，port 为 None）。
+    """
+    if isinstance(data, dict):
+        servers = data.get("servers")
+    elif isinstance(data, list):
+        servers = data
+    else:
+        servers = None
+    if not isinstance(servers, list):
+        return []
+
+    def as_int(value: Any) -> int | None:
         try:
-            validated_entries.append(_validate_history_entry(item, idx))
-        except ValueError as exc:
-            die("VPN GATE", f"索引条目校验失败: {exc}")
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
-    log("VPN GATE", f"索引包含 {len(validated_entries)} 个历史 CSV 文件，开始逐一下载并解析")
+    rows: list[dict[str, Any]] = []
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        hostname = str(server.get("hostname") or "").strip()
+        ip = str(server.get("ip") or "").strip()
+        if not hostname or not ip:
+            continue
 
-    merged_rows: list[dict[str, Any]] = []
-    success_files = 0
+        port: int | None = None
+        targets = server.get("probe_targets")
+        if isinstance(targets, list):
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                candidate = as_int(target.get("port"))
+                if candidate is not None and 1 <= candidate <= 65535:
+                    port = candidate
+                    break
 
-    for filename, file_url in validated_entries:
-        try:
-            csv_resp = session.get(file_url, timeout=cfg.http_timeout)
-            csv_resp.raise_for_status()
-            if not csv_resp.encoding:
-                csv_resp.encoding = "utf-8"
-            csv_text = csv_resp.text
-        except Exception as exc:  # noqa: BLE001
-            die("VPN GATE", f"下载历史 CSV 失败 [文件: {filename}, URL: {file_url}]: {exc}")
-
-        try:
-            file_rows = parse_csv(csv_text)
-        except Exception as exc:  # noqa: BLE001
-            die("VPN GATE", f"解析历史 CSV 失败 [文件: {filename}]: {exc}")
-
-        success_files += 1
-        merged_rows.extend(file_rows)
-        log("VPN GATE", f"已解析 {filename}: {len(file_rows)} 个节点")
-
-    log(
-        "VPN GATE",
-        f"成功获取历史 CSV 文件数: {success_files}/{len(validated_entries)}，总节点数: {len(merged_rows)}",
-    )
-    if success_files != len(validated_entries):
-        die(
-            "VPN GATE",
-            f"历史 CSV 未全部获取成功（成功 {success_files}/{len(validated_entries)}），拒绝继续",
+        rows.append(
+            {
+                "host": hostname,
+                "ip": ip,
+                "country_long": str(server.get("country_name") or "").strip(),
+                "country_short": str(server.get("country_code") or "").strip(),
+                "config_b64": "",
+                "ping": as_int(server.get("ping_ms")),
+                "score": as_int(server.get("score")),
+                "port": port,
+            }
         )
-    if not merged_rows:
-        die("VPN GATE", f"已获取 {success_files} 个历史 CSV 文件，但节点总数为 0")
-
-    return merged_rows, "funcra/vg-mirror/servers_history"
+    return rows
 
 
 def parse_csv(text: str) -> list[dict[str, Any]]:
@@ -666,21 +624,27 @@ def to_sstp_nodes(
             continue
         resolved_code = (resolve_country_code(raw_code, raw_country) or raw_code).upper()
 
-        config_b64 = row.get("config_b64") or ""
-        if not config_b64:
-            continue
-        try:
-            config = base64.b64decode(config_b64, validate=False).decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
-            continue
-        if not _PROTO_TCP_RE.search(config):
-            continue
-        match = _REMOTE_RE.search(config)
-        if not match:
-            continue
-        port = int(match.group(2))
-        if not 1 <= port <= 65535:
-            continue
+        # 节点池行自带 port（probe_targets 的 TCP 端口即 SSTP 端口），直接用；
+        # 没有合法 port 的行走原有路径：解码 OpenVPN 配置取 remote 端口。
+        raw_port = row.get("port")
+        if isinstance(raw_port, int) and not isinstance(raw_port, bool) and 1 <= raw_port <= 65535:
+            port = raw_port
+        else:
+            config_b64 = row.get("config_b64") or ""
+            if not config_b64:
+                continue
+            try:
+                config = base64.b64decode(config_b64, validate=False).decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                continue
+            if not _PROTO_TCP_RE.search(config):
+                continue
+            match = _REMOTE_RE.search(config)
+            if not match:
+                continue
+            port = int(match.group(2))
+            if not 1 <= port <= 65535:
+                continue
 
         host = (row.get("host") or "").strip().lower()
         if not host:

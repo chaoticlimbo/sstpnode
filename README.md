@@ -20,7 +20,7 @@
 ```
 GitHub Actions (手动或 cron)
         │
-        ├─ 抓取 VPN Gate API（失败回退 GitHub 镜像）
+        ├─ 抓取节点池（GeorgeXie2333/vpngate-list-mirror 的 pool/servers.json）
         ├─ 解析 OpenVPN 配置 → 只保留 proto tcp → 得到 SSTP 候选
         ├─ 去重 + 按 Ping 预排序 +（可选）截断
         ├─ 并发请求 Cloudflare Worker: /check?sstp=vpn:vpn@host:port
