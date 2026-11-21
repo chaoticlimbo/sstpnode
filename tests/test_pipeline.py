@@ -1,3 +1,4 @@
+import csv
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -160,6 +161,23 @@ def test_check_one_http_error_becomes_stub():
     assert result["error"] == "HTTP 503"
 
 
+def test_flatten_result_expands_nested_fields():
+    result = {
+        "candidate": "vpn:vpn@h.opengw.net:443",
+        "success": True,
+        "responseTime": 123,
+        "error": None,
+        "exit": {"country_code": "JP", "asn": {"asn": "AS1", "name": "ISP"}},
+    }
+    flat = pipeline.flatten_result(result)
+    assert flat["candidate"] == "vpn:vpn@h.opengw.net:443"
+    assert flat["success"] == "true"
+    assert flat["responseTime"] == "123"
+    assert flat["error"] == ""
+    assert flat["exit.country_code"] == "JP"
+    assert flat["exit.asn.name"] == "ISP"
+
+
 # ---------------------------------------------------------------------------
 # 集成测试：假服务器同时供池子 JSON 和 /check
 # ---------------------------------------------------------------------------
@@ -249,7 +267,7 @@ def server():
 
 def test_main_end_to_end(server, monkeypatch, tmp_path):
     collect = tmp_path / "node-collect.txt"
-    tests = tmp_path / "node-tests.txt"
+    tests = tmp_path / "node-tests.csv"
     node = tmp_path / "node.txt"
     monkeypatch.setenv("POOL_URL", f"{server}/pool")
     monkeypatch.setenv("CHECK_BASE", server)
@@ -271,14 +289,19 @@ def test_main_end_to_end(server, monkeypatch, tmp_path):
         "sstp://vpn:vpn@host-a.opengw.net:443",
     ]
 
-    # 第 2 步：一行一条 JSON，顺序与 node-collect.txt 一致
-    test_rows = [json.loads(line) for line in tests.read_text(encoding="utf-8").splitlines()]
+    # 第 2 步：CSV 一行一个节点，顺序与 node-collect.txt 一致，字段原样展开成列
+    with open(tests, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        test_rows = list(reader)
+        fieldnames = reader.fieldnames or []
+    assert "candidate" in fieldnames
+    assert "exit.country_code" in fieldnames
     assert [row["hostname"] for row in test_rows] == [
         "host-b.opengw.net",
         "host-a.opengw.net",
     ]
-    assert [row["success"] for row in test_rows] == [True, True]
-    assert test_rows[0]["exit"]["country_code"] == "JP"
+    assert [row["success"] for row in test_rows] == ["true", "true"]
+    assert test_rows[0]["exit.country_code"] == "JP"
 
     # 第 3 步：只含成功节点，按 responseTime 升序（host-a 100 < host-b 300）
     assert node.read_text(encoding="utf-8").splitlines() == [
