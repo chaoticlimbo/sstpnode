@@ -1,6 +1,3 @@
-# 由 vpngate.py 运行时生成（data.json / index.html / nodes.txt），不入库
-public/
-
 # Python
 __pycache__/
 *.py[cod]
