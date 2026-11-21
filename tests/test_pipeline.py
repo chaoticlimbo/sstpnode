@@ -7,7 +7,7 @@ import pytest
 import requests
 
 import pipeline
-from pipeline import build_collect_lines, build_node_lines, parse_origin_text, parse_pool_json
+from pipeline import build_collect_lines, build_node_lines, parse_node_lines, parse_pool_json
 
 
 # ---------------------------------------------------------------------------
@@ -85,9 +85,9 @@ def test_build_collect_lines_dedupes_and_sorts():
 
 
 # ---------------------------------------------------------------------------
-# parse_origin_text
+# parse_node_lines
 # ---------------------------------------------------------------------------
-def test_parse_origin_text_three_forms_comments_and_bad_lines():
+def test_parse_node_lines_three_forms_comments_and_bad_lines():
     text = "\n".join(
         [
             "# 待测名单",
@@ -100,7 +100,7 @@ def test_parse_origin_text_three_forms_comments_and_bad_lines():
             "sstp://vpn:vpn@host-b.opengw.net:995",  # 重复，去重
         ]
     )
-    nodes, bad = parse_origin_text(text)
+    nodes, bad = parse_node_lines(text)
     assert nodes == [
         ("host-b.opengw.net", 995),
         ("host-a.opengw.net", 443),
@@ -248,16 +248,11 @@ def server():
 
 
 def test_main_end_to_end(server, monkeypatch, tmp_path):
-    origin = tmp_path / "node-origin.txt"
-    # 预先放一份过期名单，验证第 1 步会用节点池把它刷新掉
-    origin.write_text("# 旧名单\nsstp://vpn:vpn@stale.opengw.net:443\n", encoding="utf-8")
-
     collect = tmp_path / "node-collect.txt"
     tests = tmp_path / "node-tests.txt"
     node = tmp_path / "node.txt"
     monkeypatch.setenv("POOL_URL", f"{server}/pool")
     monkeypatch.setenv("CHECK_BASE", server)
-    monkeypatch.setenv("ORIGIN_FILE", str(origin))
     monkeypatch.setenv("COLLECT_FILE", str(collect))
     monkeypatch.setenv("TESTS_FILE", str(tests))
     monkeypatch.setenv("NODE_FILE", str(node))
@@ -276,13 +271,7 @@ def test_main_end_to_end(server, monkeypatch, tmp_path):
         "sstp://vpn:vpn@host-a.opengw.net:443",
     ]
 
-    # 第 1 步同时用同一份名单刷新 node-origin.txt（旧名单被覆盖）
-    assert origin.read_text(encoding="utf-8").splitlines() == [
-        "sstp://vpn:vpn@host-b.opengw.net:995",
-        "sstp://vpn:vpn@host-a.opengw.net:443",
-    ]
-
-    # 第 2 步：一行一条 JSON，顺序与刷新后的 node-origin.txt 一致
+    # 第 2 步：一行一条 JSON，顺序与 node-collect.txt 一致
     test_rows = [json.loads(line) for line in tests.read_text(encoding="utf-8").splitlines()]
     assert [row["hostname"] for row in test_rows] == [
         "host-b.opengw.net",
