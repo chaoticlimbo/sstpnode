@@ -5,8 +5,9 @@
      拉取全部节点，取带 TCP 探测端口的条目，转成 SSTP 链接、去重，
      写 node-collect.txt（一行一个 sstp:// 链接）。
   2. 检测：把 node-collect.txt 里的节点逐个送 check.socks5.lzjbaby.com
-     检测，每个节点的完整检测结果一行一条 JSON 写 node-tests.txt，
-     与 node-collect.txt 的顺序一一对应。
+     检测，每个节点的完整检测结果写 node-tests.csv：一行一个节点，
+     检测站返回的字段原样展开成列（嵌套对象用 . 连接，如 exit.country），
+     不改名、不丢字段，行序与 node-collect.txt 一一对应。
   3. 成品：检测通过（success 为真）的节点写 node.txt，
      纯 sstp:// 一行一个，不限数量，按检测延迟 responseTime 升序。
 
@@ -15,6 +16,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import sys
@@ -89,7 +92,7 @@ class Config:
             pool_url=_env_str("POOL_URL", DEFAULT_POOL_URL),
             check_base=_env_str("CHECK_BASE", DEFAULT_CHECK_BASE).rstrip("/"),
             collect_file=_env_str("COLLECT_FILE", os.path.join(REPO_DIR, "node-collect.txt")),
-            tests_file=_env_str("TESTS_FILE", os.path.join(REPO_DIR, "node-tests.txt")),
+            tests_file=_env_str("TESTS_FILE", os.path.join(REPO_DIR, "node-tests.csv")),
             node_file=_env_str("NODE_FILE", os.path.join(REPO_DIR, "node.txt")),
             concurrency=_env_int("CHECK_CONCURRENCY", 20, minimum=1),
             check_timeout=_env_float("CHECK_TIMEOUT", 30.0, minimum=1.0),
@@ -146,6 +149,47 @@ def atomic_write_text(path: str, text: str) -> None:
 def join_lines(lines: Iterable[str]) -> str:
     lines = list(lines)
     return "\n".join(lines) + "\n" if lines else ""
+
+
+def flatten_result(result: dict[str, Any], prefix: str = "") -> dict[str, str]:
+    """把检测结果按原字段展开成一层：嵌套 dict 用 . 连接键名，不改名、不丢字段。
+
+    bool 写成 true/false（与检测站 JSON 一致），None 写空，其余转字符串；
+    极少出现的 list 用 JSON 文本兜底。
+    """
+    flat: dict[str, str] = {}
+    for key, value in result.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(flatten_result(value, prefix=f"{name}."))
+        elif isinstance(value, bool):
+            flat[name] = "true" if value else "false"
+        elif value is None:
+            flat[name] = ""
+        elif isinstance(value, (list, tuple)):
+            flat[name] = json.dumps(value, ensure_ascii=False)
+        else:
+            flat[name] = str(value)
+    return flat
+
+
+def write_tests_csv(path: str, results: list[dict[str, Any]]) -> int:
+    """全部检测结果写成 CSV：一行一个节点，列为所有展开字段的并集（按首次出现顺序）。"""
+    rows = [flatten_result(r) for r in results]
+    columns: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                columns.append(key)
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    atomic_write_text(path, buffer.getvalue())
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -425,9 +469,8 @@ def main() -> int:
     failed_count = len(results) - success_count
     log("CHECK", f"检测完成：待测 {len(targets)}，成功 {success_count}，失败 {failed_count}，用时 {elapsed:.1f}s")
 
-    tests_lines = [json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in results]
-    atomic_write_text(cfg.tests_file, join_lines(tests_lines))
-    log("CHECK", f"已写 {cfg.tests_file}（{len(tests_lines)} 行）")
+    written = write_tests_csv(cfg.tests_file, results)
+    log("CHECK", f"已写 {cfg.tests_file}（{written} 行）")
 
     # ---- 第 3 步：成品 ----
     node_lines = build_node_lines(list(zip(targets, results)))

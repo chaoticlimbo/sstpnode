@@ -6,7 +6,7 @@
 ## 三步流程
 
 1. **收集**：拉取节点池 [GeorgeXie2333/vpngate-list-mirror](https://github.com/GeorgeXie2333/vpngate-list-mirror) 的 `pool/servers.json`，取带 TCP 探测端口的节点，转成 `sstp://vpn:vpn@主机:端口`，去重后写 `node-collect.txt`。不排除任何国家。
-2. **检测**：把 `node-collect.txt` 里的节点逐个请求 `https://check.socks5.lzjbaby.com/check?sstp=...` 检测，每个节点的完整检测结果（原始 JSON，一行一条、顺序与 `node-collect.txt` 一致）写 `node-tests.txt`。
+2. **检测**：把 `node-collect.txt` 里的节点逐个请求 `https://check.socks5.lzjbaby.com/check?sstp=...` 检测，每个节点的完整检测结果写 `node-tests.csv`：一行一个节点，检测站返回的字段原样展开成列（嵌套对象用 `.` 连接，如 `exit.country`），顺序与 `node-collect.txt` 一致。
 3. **成品**：检测通过（`success` 为真）的节点写 `node.txt`，纯 `sstp://` 一行一个，不限数量，按检测延迟 `responseTime` 从低到高排序。
 
 ## 三个文件
@@ -14,7 +14,7 @@
 | 文件 | 说明 |
 | --- | --- |
 | `node-collect.txt` | 每次运行的产物：第 1 步从节点池收集到的全部 TCP 节点（去重、按池子 ping 排序），第 2 步检测的就是这份名单。 |
-| `node-tests.txt` | 每次运行的产物：第 2 步的完整检测结果，一行一条 JSON，含成功与失败。 |
+| `node-tests.csv` | 每次运行的产物：第 2 步的完整检测结果，一行一个节点，字段原样展开成列，含成功与失败。 |
 | `node.txt` | 每次运行的产物：第 3 步的成品，通过检测的节点，按延迟升序。 |
 
 ## 如何运行
