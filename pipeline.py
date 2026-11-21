@@ -3,11 +3,10 @@
 流程：
   1. 收集：从节点池（GeorgeXie2333/vpngate-list-mirror 的 pool/servers.json）
      拉取全部节点，取带 TCP 探测端口的条目，转成 SSTP 链接、去重，
-     写 node-collect.txt（一行一个 sstp:// 链接），并用同一份名单
-     更新 node-origin.txt（每次运行都由节点池刷新，不是独立输入文件）。
-  2. 检测：读 node-origin.txt（即第 1 步刚更新的名单），逐个送
-     check.socks5.lzjbaby.com 检测，每个节点的完整检测结果一行一条
-     JSON 写 node-tests.txt，与 node-origin.txt 的顺序一一对应。
+     写 node-collect.txt（一行一个 sstp:// 链接）。
+  2. 检测：把 node-collect.txt 里的节点逐个送 check.socks5.lzjbaby.com
+     检测，每个节点的完整检测结果一行一条 JSON 写 node-tests.txt，
+     与 node-collect.txt 的顺序一一对应。
   3. 成品：检测通过（success 为真）的节点写 node.txt，
      纯 sstp:// 一行一个，不限数量，按检测延迟 responseTime 升序。
 
@@ -75,7 +74,6 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 class Config:
     pool_url: str
     check_base: str
-    origin_file: str
     collect_file: str
     tests_file: str
     node_file: str
@@ -90,7 +88,6 @@ class Config:
         return cls(
             pool_url=_env_str("POOL_URL", DEFAULT_POOL_URL),
             check_base=_env_str("CHECK_BASE", DEFAULT_CHECK_BASE).rstrip("/"),
-            origin_file=_env_str("ORIGIN_FILE", os.path.join(REPO_DIR, "node-origin.txt")),
             collect_file=_env_str("COLLECT_FILE", os.path.join(REPO_DIR, "node-collect.txt")),
             tests_file=_env_str("TESTS_FILE", os.path.join(REPO_DIR, "node-tests.txt")),
             node_file=_env_str("NODE_FILE", os.path.join(REPO_DIR, "node.txt")),
@@ -232,10 +229,10 @@ def build_collect_lines(nodes: Iterable[tuple[str, int, int | None]]) -> list[st
 
 
 # ---------------------------------------------------------------------------
-# 第 2 步：检测 node-origin.txt 里的节点
+# 第 2 步：检测 node-collect.txt 里的节点
 # ---------------------------------------------------------------------------
-def parse_origin_text(text: str) -> tuple[list[tuple[str, int]], int]:
-    """解析待测名单，返回 ([(host, port)], 坏行数)。
+def parse_node_lines(text: str) -> tuple[list[tuple[str, int]], int]:
+    """解析节点名单文本，返回 ([(host, port)], 坏行数)。
 
     每行接受三种写法：sstp://vpn:vpn@host:port、vpn:vpn@host:port、host:port。
     空行与 # 注释行跳过；无法解析的行跳过并计数；去重保留首次出现顺序。
@@ -406,21 +403,19 @@ def main() -> int:
         return 2
     atomic_write_text(cfg.collect_file, join_lines(collect_lines))
     log("POOL", f"已写 {cfg.collect_file}（{len(collect_lines)} 行）")
-    atomic_write_text(cfg.origin_file, join_lines(collect_lines))
-    log("POOL", f"已用同一份名单更新 {cfg.origin_file}（{len(collect_lines)} 行）")
 
-    # ---- 第 2 步：检测 ----
-    with open(cfg.origin_file, encoding="utf-8", errors="replace") as fh:
-        origin_text = fh.read()
-    origin_nodes, bad_lines = parse_origin_text(origin_text)
-    log("ORIGIN", f"待测名单解析出 {len(origin_nodes)} 个节点，坏行 {bad_lines}")
-    if not origin_nodes:
-        log("ORIGIN", "待测名单里没有可检测的节点，拒绝继续")
+    # ---- 第 2 步：检测（读回刚写的 node-collect.txt，保证测的就是文件里的节点） ----
+    with open(cfg.collect_file, encoding="utf-8", errors="replace") as fh:
+        collect_text = fh.read()
+    targets_all, bad_lines = parse_node_lines(collect_text)
+    log("COLLECT", f"待测节点解析出 {len(targets_all)} 个，坏行 {bad_lines}")
+    if not targets_all:
+        log("COLLECT", "node-collect.txt 里没有可检测的节点，拒绝继续")
         return 2
 
-    targets = origin_nodes
+    targets = targets_all
     if cfg.max_test_nodes > 0:
-        targets = origin_nodes[: cfg.max_test_nodes]
+        targets = targets_all[: cfg.max_test_nodes]
         log("CHECK", f"MAX_TEST_NODES={cfg.max_test_nodes}，本次只测前 {len(targets)} 个")
 
     check_started = time.time()
