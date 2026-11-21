@@ -186,6 +186,112 @@ def test_parse_mirror_json_reads_servers():
 
 
 # ---------------------------------------------------------------------------
+# 节点池 JSON 解析（GeorgeXie2333/vpngate-list-mirror pool/servers.json）
+# ---------------------------------------------------------------------------
+def test_parse_pool_json_maps_fields_and_ports():
+    data = {
+        "kind": "vpngate-pool",
+        "schema_version": 1,
+        "server_count": 3,
+        "servers": [
+            {
+                "hostname": "vpn123456789",
+                "ip": "203.0.113.9",
+                "country_code": "JP",
+                "country_name": "Japan",
+                "ping_ms": 12,
+                "score": 1000,
+                "probe_reason": "tcp",
+                "probe_targets": [{"ip": "203.0.113.9", "port": 995}],
+            },
+            {
+                "hostname": "vpn987654321",
+                "ip": "203.0.113.10",
+                "country_code": "JP",
+                "country_name": "Japan",
+                "ping_ms": 80,
+                "score": 900,
+                "probe_reason": "udp",
+                "probe_targets": [],
+            },
+            {
+                "ip": "203.0.113.11",
+                "country_code": "JP",
+                "country_name": "Japan",
+                "ping_ms": 30,
+                "score": 800,
+                "probe_reason": "tcp",
+                "probe_targets": [{"ip": "203.0.113.11", "port": 443}],
+            },
+        ],
+    }
+    rows = vpngate.parse_pool_json(data)
+    assert len(rows) == 2
+    tcp_row, udp_row = rows
+    assert tcp_row["host"] == "vpn123456789"
+    assert tcp_row["ip"] == "203.0.113.9"
+    assert tcp_row["country_short"] == "JP"
+    assert tcp_row["country_long"] == "Japan"
+    assert tcp_row["ping"] == 12
+    assert tcp_row["score"] == 1000
+    assert tcp_row["port"] == 995
+    assert tcp_row["config_b64"] == ""
+    assert udp_row["host"] == "vpn987654321"
+    assert udp_row["port"] is None
+
+
+def test_parse_pool_json_accepts_bare_list_and_rejects_bad_shapes():
+    assert vpngate.parse_pool_json({"servers": "nope"}) == []
+    assert vpngate.parse_pool_json(42) == []
+    rows = vpngate.parse_pool_json(
+        [{"hostname": "vpn111", "ip": "203.0.113.1", "probe_targets": [{"port": "443"}]}]
+    )
+    assert len(rows) == 1
+    assert rows[0]["port"] == 443
+
+
+def test_to_sstp_nodes_uses_direct_port_without_config():
+    rows = [
+        {
+            "host": "vpn123456789",
+            "ip": "203.0.113.9",
+            "country_long": "Japan",
+            "country_short": "JP",
+            "config_b64": "",
+            "ping": 12,
+            "score": 1000,
+            "port": 995,
+        },
+        {
+            "host": "vpn555555555",
+            "ip": "203.0.113.20",
+            "country_long": "Russia",
+            "country_short": "RU",
+            "config_b64": "",
+            "ping": 10,
+            "score": 1000,
+            "port": 443,
+        },
+        {
+            "host": "vpn666666666",
+            "ip": "203.0.113.21",
+            "country_long": "Japan",
+            "country_short": "JP",
+            "config_b64": "",
+            "ping": 10,
+            "score": 1000,
+            "port": None,
+        },
+    ]
+    nodes = vpngate.to_sstp_nodes(rows)
+    assert len(nodes) == 1
+    assert nodes[0].host == "vpn123456789.opengw.net"
+    assert nodes[0].port == 995
+    assert nodes[0].ip == "203.0.113.9"
+    assert nodes[0].country_code == "JP"
+
+
+# ---------------------------------------------------------------------------
 # 去重 / 排序 / 分类
 # ---------------------------------------------------------------------------
 def test_dedupe_and_prioritize():

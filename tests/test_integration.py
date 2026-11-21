@@ -1,4 +1,3 @@
-import base64
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -8,27 +7,36 @@ import pytest
 
 import vpngate
 
-HEADER = (
-    "#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,"
-    "TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64"
-)
 
-
-def b64(text: str) -> str:
-    return base64.b64encode(text.encode("utf-8")).decode("ascii")
-
-
-def make_csv() -> str:
-    tcp = b64("proto tcp\nremote 203.0.113.9 443\n")
-    udp = b64("proto udp\nremote 203.0.113.10 1194\n")
-    return "\n".join(
-        [
-            "*",
-            HEADER,
-            f"public-vpn-1,203.0.113.9,1000,12,1000000,Japan,JP,1,1,1,1,2weeks,op,,{tcp}",
-            f"public-vpn-2,203.0.113.10,900,80,1000000,Japan,JP,1,1,1,1,2weeks,op,,{udp}",
-            "*",
-        ]
+def make_pool() -> str:
+    return json.dumps(
+        {
+            "kind": "vpngate-pool",
+            "schema_version": 1,
+            "server_count": 2,
+            "servers": [
+                {
+                    "hostname": "public-vpn-1",
+                    "ip": "203.0.113.9",
+                    "country_code": "JP",
+                    "country_name": "Japan",
+                    "ping_ms": 12,
+                    "score": 1000,
+                    "probe_reason": "tcp",
+                    "probe_targets": [{"ip": "203.0.113.9", "port": 443}],
+                },
+                {
+                    "hostname": "public-vpn-2",
+                    "ip": "203.0.113.10",
+                    "country_code": "JP",
+                    "country_name": "Japan",
+                    "ping_ms": 80,
+                    "score": 900,
+                    "probe_reason": "udp",
+                    "probe_targets": [],
+                },
+            ],
+        }
     )
 
 
@@ -50,12 +58,12 @@ CHECK_OK = {
 CHECK_FAIL = {"success": False, "error": "sstp handshake timeout"}
 
 
-def build_handler(csv_body: str, payload: dict) -> type[BaseHTTPRequestHandler]:
+def build_handler(pool_body: str, payload: dict) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 - http.server 接口
             path = urlsplit(self.path).path
-            if path == "/api":
-                body, ctype = csv_body.encode("utf-8"), "text/plain; charset=utf-8"
+            if path == "/pool":
+                body, ctype = pool_body.encode("utf-8"), "application/json"
             elif path == "/check":
                 body, ctype = json.dumps(payload).encode("utf-8"), "application/json"
             else:
@@ -78,8 +86,8 @@ def build_handler(csv_body: str, payload: dict) -> type[BaseHTTPRequestHandler]:
 def server():
     servers: list[HTTPServer] = []
 
-    def start(csv_body: str, payload: dict) -> str:
-        httpd = HTTPServer(("127.0.0.1", 0), build_handler(csv_body, payload))
+    def start(pool_body: str, payload: dict) -> str:
+        httpd = HTTPServer(("127.0.0.1", 0), build_handler(pool_body, payload))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         servers.append(httpd)
         return f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -91,7 +99,8 @@ def server():
 
 
 def prepare_env(monkeypatch, base: str, public_dir, **extra):
-    monkeypatch.setenv("VPNGATE_API", f"{base}/api")
+    monkeypatch.setenv("POOL_URL", f"{base}/pool")
+    monkeypatch.delenv("VPNGATE_API", raising=False)
     monkeypatch.setenv("CHECK_WORKER", f"{base}/check?sstp=vpn:vpn@")
     monkeypatch.setenv("PUBLIC_DIR", str(public_dir))
     monkeypatch.setenv("OPTIMAL_API", "")
@@ -109,7 +118,7 @@ def prepare_env(monkeypatch, base: str, public_dir, **extra):
 
 
 def test_main_generates_all_artifacts(server, monkeypatch, tmp_path):
-    base = server(make_csv(), CHECK_OK)
+    base = server(make_pool(), CHECK_OK)
     prepare_env(monkeypatch, base, tmp_path / "public")
 
     vpngate.main()
@@ -133,7 +142,7 @@ def test_main_generates_all_artifacts(server, monkeypatch, tmp_path):
 
 
 def test_main_refuses_to_publish_when_all_checks_fail(server, monkeypatch, tmp_path):
-    base = server(make_csv(), CHECK_FAIL)
+    base = server(make_pool(), CHECK_FAIL)
     public_dir = tmp_path / "public"
     prepare_env(monkeypatch, base, public_dir)
 
@@ -146,7 +155,7 @@ def test_main_refuses_to_publish_when_all_checks_fail(server, monkeypatch, tmp_p
 
 
 def test_main_fails_fast_without_worker_config(server, monkeypatch, tmp_path):
-    base = server(make_csv(), CHECK_OK)
+    base = server(make_pool(), CHECK_OK)
     prepare_env(monkeypatch, base, tmp_path / "public")
     monkeypatch.delenv("CHECK_WORKER", raising=False)
 
