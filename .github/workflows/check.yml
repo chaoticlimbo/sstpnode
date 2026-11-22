@@ -19,6 +19,11 @@ on:
 permissions:
   contents: write
 
+# 同一时间只跑一个流水线，避免两次运行互相抢推产物
+concurrency:
+  group: sstpnode-pipeline
+  cancel-in-progress: false
+
 jobs:
   pipeline:
     runs-on: ubuntu-latest
@@ -52,5 +57,17 @@ jobs:
             echo "产物无变化，跳过提交"
           else
             git commit -m "Update node pipeline outputs"
-            git push
+            # 运行期间远端可能有新提交：推送被拒时先 rebase 到最新 main 再重试，
+            # 三个产物文件如有冲突，以本次新生成的结果为准
+            for i in 1 2 3; do
+              if git push; then
+                break
+              fi
+              if [ "$i" = "3" ]; then
+                echo "推送重试 3 次仍失败"
+                exit 1
+              fi
+              git fetch origin main
+              git rebase -X theirs origin/main || { git rebase --abort; exit 1; }
+            done
           fi
