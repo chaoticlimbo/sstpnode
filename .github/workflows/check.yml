@@ -14,7 +14,7 @@ on:
       timeout:
         description: '单节点检测超时（秒）'
         required: false
-        default: '30'
+        default: '20'
 
 permissions:
   contents: write
@@ -45,7 +45,7 @@ jobs:
         env:
           MAX_TEST_NODES: ${{ github.event.inputs.max_test_nodes || '0' }}
           CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '32' }}
-          CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '30' }}
+          CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '20' }}
         run: python pipeline.py
 
       - name: Commit outputs
