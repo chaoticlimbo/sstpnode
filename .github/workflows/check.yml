@@ -10,7 +10,7 @@ on:
       concurrency:
         description: '检测并发数（建议 16–32）'
         required: false
-        default: '20'
+        default: '32'
       timeout:
         description: '单节点检测超时（秒）'
         required: false
@@ -44,7 +44,7 @@ jobs:
       - name: Run pipeline
         env:
           MAX_TEST_NODES: ${{ github.event.inputs.max_test_nodes || '0' }}
-          CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '20' }}
+          CHECK_CONCURRENCY: ${{ github.event.inputs.concurrency || '32' }}
           CHECK_TIMEOUT: ${{ github.event.inputs.timeout || '30' }}
         run: python pipeline.py
 
