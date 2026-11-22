@@ -94,7 +94,7 @@ class Config:
             collect_file=_env_str("COLLECT_FILE", os.path.join(REPO_DIR, "node-collect.txt")),
             tests_file=_env_str("TESTS_FILE", os.path.join(REPO_DIR, "node-tests.csv")),
             node_file=_env_str("NODE_FILE", os.path.join(REPO_DIR, "node.txt")),
-            concurrency=_env_int("CHECK_CONCURRENCY", 20, minimum=1),
+            concurrency=_env_int("CHECK_CONCURRENCY", 32, minimum=1),
             check_timeout=_env_float("CHECK_TIMEOUT", 30.0, minimum=1.0),
             deadline_s=_env_float("CHECK_DEADLINE", 3000.0, minimum=30.0),
             max_test_nodes=_env_int("MAX_TEST_NODES", 0),
